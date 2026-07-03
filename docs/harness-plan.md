@@ -175,17 +175,42 @@ build them *after* the CLI, not instead of it:
 Recommendation: CLI now, Claude Code skill when the CLI works, MCP only if a
 second client appears. Don't let the wrapper precede the thing it wraps.
 
+## The record is the artifact; the HTML is a view
+
+The durable output of a review is **not** the report — it's a findings JSONL
+(`reviewer_core::CriticFinding`, one per critic comment). Each finding carries
+the verbatim hunk, the exact prompt, the comment, the grounding result, the
+critic's `model_version`, and a slot for a `HumanLabel`. The HTML is a rendered
+view of that record. This inversion is load-bearing: the labeled stream
+`(hunk + critic_comment) → verdict` **is the judge model's training set**, so if
+the critic's output only ever became HTML, the training signal would be lost the
+moment the tab closed.
+
+The judge is therefore not a runtime LLM filter — it's a *second specialist
+model* trained on captured critic findings + human verdicts, which then
+pre-filters so a human only judges the borderline cases (active-learning
+flywheel). Grounding (stage 4) is a cheap deterministic **safety net** around the
+critic's signal, not the judge and not a quality verdict.
+
+The record is append-and-**merge**, keyed by a content hash of
+`(model_version, repo, pr, path, hunk_header, comment)` — so re-running a review
+dedupes and preserves verdicts already made. `model_version` is part of the key
+because findings from different checkpoints are different distributions.
+
 ## Build order (measure-first)
 
-1. `reviewer-core`: pull the formatting/SYSTEM prompt out of `reviewer-prepare`
-   into the shared crate (kills skew before it exists).
-2. `reviewer-run` stages 1–2 + 6: fetch a real PR, segment it, render the diff
-   to HTML — **no model yet.** Proves the deterministic spine end to end.
-3. Wait for the adapter; wire stage 3 to the served endpoint with the training
-   SYSTEM prompt; run one real hunk.
-4. Stage 4 ground-check + stage 5 overlap-marking.
-5. **Measure** on held-out PRs with real design comments (blog 4's test). Only
-   *then* decide whether stages need the LLM judge or the agentic tool.
-6. Stage 7 feedback logging; skill wrapper.
+1. ✅ `reviewer-core`: shared SYSTEM prompt + `user_prompt()` (skew killed);
+   plus the `CriticFinding` / `HumanLabel` / `Verdict` record types.
+2. ✅ `reviewer-run review` stages 1–2 + 6: fetch, segment, render — proven on
+   live rustc PRs.
+3. ✅ Stage 3 as a swappable `Critic` trait (`StubCritic` today) + stage 4
+   grounding + the findings record (capture → merge → persist).
+4. ✅ Stage 7 `reviewer-run label`: human-in-the-loop that writes verdicts back;
+   the closed loop (review → label → re-review keeps labels) is tested.
+5. ⏳ Wait for the adapter; implement `HttpCritic` against the served endpoint
+   (drops into the trait — nothing else changes).
+6. ⏳ **Measure** on held-out PRs with real design comments (blog 4's test). Only
+   *then* train the judge on the accumulated labels, or add an agentic tool.
+7. ⏳ Skill wrapper (`/review-pr`); optional MCP server.
 
-Steps 1–2 are buildable **today**, while the model cooks.
+Steps 1–4 are **done** and tested while the model cooks; 5 is a single trait impl.

@@ -1,0 +1,196 @@
+# The model is one box in the diagram
+
+*Part 5: building the review harness while the model trained — and why most of
+it turned out not to be the model*
+
+[Part 4](blog-04-watching-it-learn.md) left the LoRA cooking — 25% in, two loss
+curves, ~two days on the clock. Waiting two days is not a plan, so I built the
+thing that will *use* the model. The surprise, which in hindsight shouldn't have
+been one, is that almost none of that work needed the model, or even needed the
+model to exist yet. The reviewer is a program with exactly one model-shaped hole
+in it, and the program is the part you can build, test, and be wrong about today.
+
+## The plans I was handed
+
+I went looking for architecture ideas and got some — confident, fluent, full of
+box-and-arrow diagrams. A dual-machine split. A Rust agent framework driving an
+OpenAI-compatible endpoint. An actor-critic pipeline where a LoRA "critic" is
+policed by a base-model "judge." vLLM hot-swapping adapters. Crank
+`--gpu-memory-utilization 0.95` and pin a 128k context. Every plan *sounded*
+like the architecture of a serious system.
+
+The useful work was subtraction. Three of those confident suggestions were the
+exact failure modes this whole series is about:
+
+- **"Crank `--gpu-memory-utilization 0.95`."** This is [part 3's
+  bug](blog-03-bringing-up-the-box.md) wearing a new hat. On the GB10's unified
+  memory, an inference engine's memory profiler faces the same ambiguity
+  `accelerate` did — and 0.95 of a 121 GiB pool *that the OS also lives in* is
+  how you OOM the box, not how you tune it. A number from a blog post is not a
+  measurement of your machine.
+- **"You are an expert core contributor to the Rust compiler."** The plan
+  quietly swapped in a generic compiler-Q&A persona and an AST-traversal
+  toolchain. But I didn't train a compiler oracle. I trained a thing that reads
+  a *diff hunk* and writes the *review comment a maintainer would leave* — one
+  narrow job, conditioned on one specific system prompt. Prompt it to be an
+  exhaustive architecture explainer and you throw the training away and get
+  confident Qwen with a faint accent.
+- **"Make the critic aggressive; the judge filters the noise."** I spent the
+  entire [data pipeline](blog-01-building-an-all-rust-reviewer.md) — the
+  design-score filter, dropping nits — teaching the model to be *selective*.
+  Prompting it to "be exhaustive" pushes it off that distribution to manufacture
+  noise, so you can build a second GPU pass to clean the noise back up. Two
+  stages that cancel out.
+
+None of these are dumb ideas in the abstract. They're dumb *for this artifact*,
+and the only way to know that is to hold the plan up against the thing you
+actually trained instead of the thing the diagram imagines you trained. The
+impressive architecture and the correct one are rarely the same architecture.
+
+## One LLM stage in the middle
+
+Here's the whole harness:
+
+```
+ FETCH ──▶ SEGMENT ──▶ REVIEW ──▶ GROUND ──▶ DISTILL ──▶ EMIT
+ (Rust)    (Rust)      (model)    (Rust)      (Rust)      (Rust)
+```
+
+Five of the six stages are ordinary, deterministic, unit-testable Rust:
+
+- **Fetch** a PR's metadata, its base-relative diff, and the existing human
+  comments (both for context and, later, as an eval yardstick).
+- **Segment** the unified diff into per-file, per-hunk units — a small parser
+  that tracks old/new line numbers and keeps each hunk's verbatim text.
+- **Ground-check** the model's output against the actual diff (more below).
+- **Distill** per-hunk comments into a PR-level review, de-duplicated and
+  cross-referenced against what a human already said.
+- **Emit** a self-contained HTML report you open with `file://`.
+
+The model does exactly one thing: `hunk → design comment`. The thing it was
+trained for, and nothing else. Every capability the model *doesn't* need — diff
+parsing, line arithmetic, HTML, deduplication, "does this line even exist" — is
+code, not inference. That's not an aesthetic preference; it's the difference
+between a system you can test and a system you can only vibe-check. A regex bug
+in the segmenter fails a unit test in 3 milliseconds. The same bug delegated to
+the model fails as a plausible-looking hallucination you might never catch.
+
+The model is one box. I kept wanting it to be the interesting box. It's the box
+you have the least control over, so the engineering is mostly about making it do
+as little as possible.
+
+## The skew trap, closed by construction
+
+Here's the bug that would have quietly wrecked everything, and it has no
+traceback. The model trained on hunks formatted one specific way:
+
+```
+Repository: rust-lang/rust
+Pull request: #1082
+File: src/lib/float.rs
+
+```diff
+@@ -223,6 +223,51 @@ fn neg_infinity() -> float {
+```
+
+If the harness formats a hunk even slightly differently at *serve* time — a
+different header, an extra blank line, a reworded system prompt — the model sees
+an input unlike anything in training and silently gets worse. No error. No
+crash. Just a quietly duller reviewer, and no line in any log telling you the
+formatting drifted. This is **train/serve skew**, and it's the kind of bug that
+survives for months because everything "works."
+
+The fix is boring and total: there is exactly *one* definition of the system
+prompt and the hunk format, it lives in a shared `reviewer-core` crate, and both
+the training-data builder and the inference harness call it. Not "the same
+format" — the *same function*. Skew isn't prevented by discipline; it's made
+unrepresentable.
+
+And then — because this is a *measure, don't assume* project — I didn't trust
+that argument either. The harness has a `--dump-prompts` flag that writes the
+exact bytes it would send the model. I dumped a hunk and diffed it against a real
+training example. Byte-identical in shape. The invariant I designed for, I also
+confirmed. Two minutes, and now I *know* instead of believe.
+
+## Grounding is a safety net; the judge is a second specialist
+
+I first wrote this section arguing "the cheapest judge is not a model" — that a
+`contains` check ("does the line this comment cites actually appear in the
+diff?") does the judge's whole job for thirty lines of Rust and zero GPU. That
+check is real and worth having: it catches the one way a comment can be
+*mechanically* wrong, for free. But calling it "the judge" was me smuggling in an
+assumption — that the critic's output is mostly noise to be filtered, and that
+the filtering is the interesting part. Both wrong, and a collaborator caught me
+on it: *you think the only comments from an LLM are imagined?*
+
+No. The critic's comments are the **signal**. Grounding is a guardrail around
+them, not a verdict on them. The actual judge — the thing that decides "is this a
+real design concern or a nit?" — is a *second specialist model*, and its point
+isn't to run at inference time as a filter. Its point is to be **trained on the
+critic's real outputs paired with my judgments of them.** Every time I read a
+critic comment and mark it a genuine design problem or noise, I mint one labeled
+row: `(hunk + critic_comment) → verdict`. Enough of those and you train a judge
+to predict the verdict, which then pre-filters so I only hand-judge the
+borderline cases. That's a flywheel, the opposite of a static filter — and I'd
+argued against building the very thing the design was reaching for.
+
+Which flips what the harness is *for*. If the critic runs and its output only
+becomes HTML I skim, the training signal evaporates the moment I close the tab.
+So the durable artifact is **not** the report — it's a findings record. Each
+finding persists everything a downstream consumer needs: the verbatim hunk, the
+exact prompt, the comment, the grounding result, *which critic checkpoint
+produced it*, and a slot for my verdict. The HTML is a rendered *view* of that
+record. Get this backwards — make the pretty artifact the output and let the
+structured record be a lossy afterthought — and you can never train the second
+specialist, because you fed its training data to the trash one closed browser tab
+at a time. The record is append-and-merge, keyed by a content hash of the
+finding, so re-running a review dedupes and keeps every verdict I've already
+made. Label a finding once; it stays labeled.
+
+## Proving it before the model exists
+
+The payoff of building the deterministic spine first: I can run the whole thing
+on a real PR *today*, with the model stage stubbed as a "pending" banner. So I
+pointed it at `rust-lang/rust#9812` — 5 files, 18 hunks, 5 inline review
+comments, 15 discussion comments. It fetched, segmented, anchored every human
+comment to its file and line, and rendered a clean diff report. 148 added lines,
+9 removed, all with correct line numbers, in a report I opened in a browser.
+
+Everything in that report is real except the one box that's still training. When
+the adapter lands, wiring it in is a single call — take each hunk's verbatim
+text, pass it through the *same* `reviewer-core` formatter, send it to the
+endpoint, drop the response where the banner is. The scaffolding it plugs into is
+already tested against live rustc data. The model doesn't get to surprise me with
+anything except its actual answers.
+
+## The theme
+
+The recurring lesson mutates again. Part 2: measure before you optimize. Part 3:
+the label is not the operation. Part 4: watch the curve you didn't ask for. This
+one: **the model is one box in the diagram, and treating it as the whole system
+is how you end up unable to test any of it.**
+
+The confident plans all centered the model — bigger context, cleverer
+multi-agent dances, crank the knobs. The actual engineering was the opposite:
+shrink the model's job to the one thing it was trained for, make everything
+around it deterministic and tested, and make the seam between them
+skew-proof by construction. Most of a good AI system, it turns out, is the
+un-flashy code that surrounds the flashy part and keeps it honest.
+
+There's a bet underneath all of this, and it's worth naming. A frontier model can
+feel productive partly *because* it's expensive and slow — you assume the wait and
+the price bought you something, when sometimes the cost is just being mistaken for
+results. Call it the horizon effect. The wager here is that a stack of narrow
+specialists — a critic that only reviews hunks, a judge that only rates critiques,
+deterministic Rust for everything that isn't a judgment call — each with a short
+context and a job small enough to *verify*, can match the generalist at a fraction
+of that horizon. I don't know yet whether the bet pays. But notice you can't even
+**measure** it without capturing what each specialist produces and what a human
+thought of it — which is exactly why the un-glamorous findings record, not the
+pretty report, turned out to be the load-bearing part.
+
+The reviewer's body is built and tested, and it now remembers everything it sees.
+Its brain is at 25% and climbing. Part 6 is the join: the first time a diff the
+model never saw goes in one end, and I get to find out whether the specialist
+gives back a real design concern — and start collecting the verdicts that will
+train the judge to tell me when it doesn't.
