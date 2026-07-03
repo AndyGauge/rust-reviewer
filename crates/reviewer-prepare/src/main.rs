@@ -182,11 +182,34 @@ fn score(body: &str, reply_count: u32, lex: &Lexicon) -> (String, f32) {
     (category.to_string(), s)
 }
 
+/// Remove `<!-- ... -->` spans (possibly multi-line). Unterminated openers drop
+/// the remainder, matching how a browser would hide it.
+fn strip_html_comments(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn clean_body(body: &str) -> String {
+    // Strip HTML comments first (GitHub review templates hide instructions in
+    // `<!-- ... -->`, which would otherwise leak into training targets). They
+    // can span lines, so this runs before the line-oriented pass below.
+    let body = strip_html_comments(body);
     let mut out = String::new();
     for line in body.lines() {
         let t = line.trim_end();
-        // Drop quoted text (replies often quote the parent) and HTML comments.
+        // Drop quoted text (replies often quote the parent).
         if t.trim_start().starts_with('>') {
             continue;
         }

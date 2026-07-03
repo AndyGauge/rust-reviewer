@@ -46,6 +46,7 @@ struct Args {
     /// Number of concurrent time-sharded workers. 1 = sequential (resumable,
     /// checkpointed). >1 = split [since, until] into N windows crawled in
     /// parallel — far faster when latency-bound, as the GitHub API is here.
+    /// NOTE: concurrent mode is NOT checkpointed; a crash loses the whole crawl.
     #[arg(long, default_value_t = 1)]
     workers: usize,
 
@@ -273,6 +274,7 @@ async fn get_with_backoff(
     token: &str,
 ) -> Result<reqwest::Response> {
     let mut attempt = 0u32;
+    let mut rate_limit_waits = 0u32;
     loop {
         let resp = client
             .get(url)
@@ -291,9 +293,16 @@ async fn get_with_backoff(
             return Ok(resp);
         }
 
-        // 403/429 with a reset or Retry-After => rate limited, wait it out.
-        if status == 403 || status == 429 {
+        // Genuine rate limiting: a 429, or a 403 that has *actually* exhausted
+        // the budget (remaining == 0). GitHub attaches x-ratelimit-* headers to
+        // essentially every response, including permission-denied 403s ("Resource
+        // not accessible", SSO-blocked tokens) — so treating any 403-with-reset
+        // as rate limiting sleeps a forbidden request until reset, retries, and
+        // loops forever. Gate on remaining, and cap the number of waits.
+        let rate_limited = status == 429 || (status == 403 && remaining(&resp) == Some(0));
+        if rate_limited && rate_limit_waits < 5 {
             if let Some(wait) = retry_after(&resp).or_else(|| reset_in(&resp)) {
+                rate_limit_waits += 1;
                 eprintln!("rate limited; sleeping {}s", wait.as_secs());
                 tokio::time::sleep(wait).await;
                 continue;

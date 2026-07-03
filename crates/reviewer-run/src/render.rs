@@ -12,7 +12,12 @@ use reviewer_core::{CriticFinding, Verdict};
 use crate::diff::{FileDiff, LineKind};
 use crate::github::FetchedPr;
 
-pub fn report(pr: &FetchedPr, files: &[FileDiff], findings: &[CriticFinding]) -> String {
+pub fn report(
+    pr: &FetchedPr,
+    files: &[FileDiff],
+    findings: &[CriticFinding],
+    failures: usize,
+) -> String {
     let m = &pr.meta;
     let hunks: usize = files.iter().map(|f| f.hunks.len()).sum();
     let author = m.user.as_ref().map(|u| u.login.as_str()).unwrap_or("?");
@@ -84,6 +89,16 @@ pub fn report(pr: &FetchedPr, files: &[FileDiff], findings: &[CriticFinding]) ->
         grounded,
         judged,
     );
+
+    // Incomplete-run warning: failed hunks might have held the real finding, so a
+    // clean-looking report over a partial review would be quietly misleading.
+    if failures > 0 {
+        let _ = write!(
+            s,
+            "<div class=\"banner warn\">⚠ {failures} hunk(s) failed to review after retry — \
+             this report is <b>incomplete</b>. A missing finding may have been the real one.</div>\n",
+        );
+    }
 
     // General discussion (issue comments).
     if !pr.issue_comments.is_empty() {
@@ -211,6 +226,7 @@ h1{margin:.2rem 0}h1 a{color:inherit;text-decoration:none}
 .meta{color:#666}.add{color:#1a7f37}.del{color:#cf222e}.muted{color:#999}
 code{background:#f0f0f2;padding:.1em .35em;border-radius:4px;font-size:.9em}
 .banner{background:#fff8e1;border:1px solid #f0d000;border-radius:8px;padding:.6rem .9rem;margin:1rem 0}
+.banner.warn{background:#ffebe9;border-color:#cf222e}
 h2.file{margin-top:2rem;border-top:1px solid #e0e0e2;padding-top:1rem}
 .badge{font-size:.7rem;text-transform:uppercase;padding:.15em .5em;border-radius:4px;color:#fff}
 .badge.added{background:#1a7f37}.badge.deleted{background:#cf222e}

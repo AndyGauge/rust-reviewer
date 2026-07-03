@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::diff::{Hunk, LineKind};
@@ -27,6 +27,33 @@ pub struct RawComment {
     pub cited_line: Option<u64>,
 }
 
+/// A critic failure, *classified* so the concurrency limiter only backs off on
+/// genuine congestion. A 401 (bad key) is not a signal to slow down — it's a
+/// signal every request will fail, and feeding it to the limiter would just
+/// throttle a doomed run. Only overload throttles.
+#[derive(Debug)]
+pub enum CriticError {
+    /// Overload / backpressure — 429, 503, or a timeout. The congestion signal.
+    Overload(String),
+    /// Anything else — auth, bad URL, decode. Not a congestion signal.
+    Other(anyhow::Error),
+}
+
+impl CriticError {
+    pub fn is_overload(&self) -> bool {
+        matches!(self, CriticError::Overload(_))
+    }
+}
+
+impl std::fmt::Display for CriticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CriticError::Overload(s) => write!(f, "overload ({s})"),
+            CriticError::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
 /// The review model. Static-dispatch only (no `dyn`), so `review` can be a
 /// native `async fn`.
 #[allow(async_fn_in_trait)] // used via generics on one task; no Send bound needed
@@ -35,7 +62,7 @@ pub trait Critic {
     fn model_version(&self) -> &str;
     /// Review one hunk. `prompt` is the exact `user_prompt` wire text; `hunk` is
     /// the parsed form (real impls may ignore it; the stub uses it to cite a line).
-    async fn review(&self, prompt: &str, hunk: &Hunk) -> Result<Vec<RawComment>>;
+    async fn review(&self, prompt: &str, hunk: &Hunk) -> Result<Vec<RawComment>, CriticError>;
 }
 
 /// Placeholder critic: emits one clearly-marked stub comment per hunk, anchored
@@ -48,7 +75,7 @@ impl Critic for StubCritic {
         "stub"
     }
 
-    async fn review(&self, _prompt: &str, hunk: &Hunk) -> Result<Vec<RawComment>> {
+    async fn review(&self, _prompt: &str, hunk: &Hunk) -> Result<Vec<RawComment>, CriticError> {
         let cited_line = hunk
             .lines
             .iter()
@@ -109,24 +136,35 @@ impl Critic for HttpCritic {
         &self.model_version
     }
 
-    async fn review(&self, prompt: &str, _hunk: &Hunk) -> Result<Vec<RawComment>> {
+    async fn review(&self, prompt: &str, _hunk: &Hunk) -> Result<Vec<RawComment>, CriticError> {
         let body = build_body(&self.model, prompt, self.temperature, self.max_tokens);
         let url = format!("{}/chat/completions", self.endpoint);
         let mut req = self.http.post(&url).json(&body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req.send().await.with_context(|| format!("POST {url}"))?;
-        if !resp.status().is_success() {
-            let status = resp.status();
+        let resp = req.send().await.map_err(|e| {
+            // A timeout reads as backpressure (server too busy to answer in time).
+            // A refused/failed connection or DNS/TLS error is a config/availability
+            // problem, NOT congestion — don't let it throttle the limiter.
+            if e.is_timeout() {
+                CriticError::Overload(format!("{e}"))
+            } else {
+                CriticError::Other(anyhow::Error::new(e).context(format!("POST {url}")))
+            }
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            bail!(
-                "critic endpoint {url} -> {status}: {}",
-                text.chars().take(300).collect::<String>()
-            );
+            let snippet = text.chars().take(300).collect::<String>();
+            return Err(if status == 429 || status == 503 {
+                CriticError::Overload(format!("{status}: {snippet}"))
+            } else {
+                CriticError::Other(anyhow::anyhow!("critic endpoint {url} -> {status}: {snippet}"))
+            });
         }
-        let text = resp.text().await?;
-        parse_completion(&text)
+        let text = resp.text().await.map_err(|e| CriticError::Other(e.into()))?;
+        parse_completion(&text).map_err(CriticError::Other)
     }
 }
 
@@ -148,6 +186,10 @@ fn build_body(model: &str, prompt: &str, temperature: f32, max_tokens: u32) -> s
 /// left `None`: the model emits prose, not structured citations, so grounding
 /// stays a no-op safety net until we add citation extraction. An empty/whitespace
 /// reply yields no finding.
+///
+/// Falls back to `reasoning_content`: some servers (vLLM with a reasoning parser)
+/// put the answer there with an empty `content`, which would otherwise read as
+/// "no finding."
 fn parse_completion(json: &str) -> Result<Vec<RawComment>> {
     #[derive(Deserialize)]
     struct Resp {
@@ -159,15 +201,20 @@ fn parse_completion(json: &str) -> Result<Vec<RawComment>> {
     }
     #[derive(Deserialize)]
     struct Msg {
+        #[serde(default)]
         content: String,
+        #[serde(default)]
+        reasoning_content: String,
     }
     let resp: Resp = serde_json::from_str(json).context("decoding chat completion")?;
-    let body = resp
-        .choices
-        .into_iter()
-        .next()
-        .map(|c| c.message.content)
-        .unwrap_or_default();
+    let Some(msg) = resp.choices.into_iter().next().map(|c| c.message) else {
+        return Ok(vec![]);
+    };
+    let body = if !msg.content.trim().is_empty() {
+        msg.content
+    } else {
+        msg.reasoning_content
+    };
     let body = body.trim().to_string();
     if body.is_empty() {
         return Ok(vec![]);

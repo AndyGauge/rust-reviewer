@@ -3,10 +3,10 @@
 //! [`CriticFinding`] records — the durable stream that the HTML report is a mere
 //! view of, and that the judge model will eventually train on.
 
-use std::hash::{Hash, Hasher};
+use std::collections::VecDeque;
 use std::io::Write as _;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -39,7 +39,7 @@ pub async fn collect<C: Critic>(
     session_id: &str,
     files: &[FileDiff],
     limiter: &mut AdaptiveLimiter,
-) -> Result<Vec<CriticFinding>> {
+) -> Result<(Vec<CriticFinding>, usize)> {
     let created_at = chrono::Utc::now().to_rfc3339();
 
     let jobs: Vec<Job> = files
@@ -53,34 +53,55 @@ pub async fn collect<C: Critic>(
         })
         .collect();
 
-    // Reviews complete out of order; slot each result back by index.
+    // Reviews complete out of order; slot each result back by index. A ready
+    // queue feeds a single launch site (so all in-flight futures share one type)
+    // and lets a failed hunk simply re-enqueue itself for one retry.
     let mut results: Vec<Option<Vec<RawComment>>> = (0..jobs.len()).map(|_| None).collect();
+    let mut attempts = vec![0u8; jobs.len()];
+    let mut failures = 0usize;
+    let mut ready: VecDeque<(usize, Option<Duration>)> =
+        (0..jobs.len()).map(|i| (i, None)).collect();
     let mut inflight = FuturesUnordered::new();
-    let mut next = 0usize;
 
-    while next < jobs.len() || !inflight.is_empty() {
+    while !ready.is_empty() || !inflight.is_empty() {
         // Top up to the *current* adaptive limit (it moves as results arrive).
-        while next < jobs.len() && inflight.len() < limiter.limit() {
-            let idx = next;
+        while inflight.len() < limiter.limit() {
+            let Some((idx, backoff)) = ready.pop_front() else {
+                break;
+            };
             let job = &jobs[idx];
             let start = Instant::now();
             inflight.push(async move {
+                if let Some(d) = backoff {
+                    tokio::time::sleep(d).await;
+                }
                 let r = critic.review(&job.prompt, job.hunk).await;
                 (idx, start.elapsed(), r)
             });
-            next += 1;
+            attempts[idx] += 1;
         }
-        if let Some((idx, rtt, r)) = inflight.next().await {
-            match r {
-                Ok(comments) => {
-                    limiter.on_success(rtt); // latency feeds the gradient
-                    results[idx] = Some(comments);
-                }
-                Err(e) => {
-                    // Overload/429/OOM is the back-off signal, not a fatal error:
-                    // back off and keep going so the run survives probing too high.
+        let Some((idx, rtt, r)) = inflight.next().await else {
+            continue;
+        };
+        match r {
+            Ok(comments) => {
+                limiter.on_success(rtt); // latency feeds the gradient
+                results[idx] = Some(comments);
+            }
+            Err(e) => {
+                // Only *congestion* throttles the limiter — a 401/decode error
+                // would otherwise make it needlessly slow a doomed run.
+                if e.is_overload() {
                     limiter.on_error();
-                    eprintln!("  ! hunk {idx} ({}) failed: {e:#}", jobs[idx].path);
+                }
+                if attempts[idx] < 2 {
+                    // Retry once (a failed hunk might have held the real finding).
+                    eprintln!("  ~ hunk {idx} ({}) failed ({e}); retrying", jobs[idx].path);
+                    let backoff = e.is_overload().then(|| Duration::from_millis(500));
+                    ready.push_back((idx, backoff));
+                } else {
+                    failures += 1;
+                    eprintln!("  ! hunk {idx} ({}) failed after retry: {e}", jobs[idx].path);
                     results[idx] = Some(Vec::new());
                 }
             }
@@ -118,7 +139,7 @@ pub async fn collect<C: Critic>(
             });
         }
     }
-    Ok(out)
+    Ok((out, failures))
 }
 
 /// Grounding is a safety net, not a quality judgment: a comment is grounded
@@ -139,6 +160,11 @@ fn is_grounded(cited_line: Option<u64>, hunk: &Hunk) -> bool {
 /// the same PR yields the same ids (idempotent capture), letting [`merge`]
 /// preserve human labels across runs. Provenance (which session first saw it)
 /// lives in the record's fields, not its identity.
+///
+/// FNV-1a, deliberately: `DefaultHasher`'s algorithm is *not* guaranteed stable
+/// across Rust releases, and label preservation depends on this id being
+/// reproducible forever — a toolchain bump must not silently re-hash every
+/// finding and orphan the human verdicts.
 fn finding_id(
     model_version: &str,
     repo: &str,
@@ -147,14 +173,20 @@ fn finding_id(
     hunk_header: &str,
     body: &str,
 ) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    model_version.hash(&mut h);
-    repo.hash(&mut h);
-    pr.hash(&mut h);
-    path.hash(&mut h);
-    hunk_header.hash(&mut h);
-    body.hash(&mut h);
-    format!("{:016x}", h.finish())
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let pr = pr.to_string();
+    let mut h = OFFSET;
+    for field in [model_version, repo, pr.as_str(), path, hunk_header, body] {
+        for &b in field.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+        // Field separator so ("ab","c") and ("a","bc") don't collide.
+        h ^= 0xff;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
 }
 
 /// Merge freshly-collected findings into the durable store and persist it,
@@ -193,13 +225,26 @@ pub fn load(path: &Path) -> Result<Vec<CriticFinding>> {
 }
 
 /// Rewrite a session JSONL wholesale — used after labeling mutates `human`.
+///
+/// Atomic: write a sibling temp file, fsync it, then `rename` it over the
+/// original. A crash or Ctrl-C mid-write leaves the old file intact rather than
+/// truncating the irreplaceable record (there is no re-deriving a human verdict).
 pub fn save(path: &Path, findings: &[CriticFinding]) -> Result<()> {
-    let mut f = std::fs::File::create(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    for finding in findings {
-        serde_json::to_writer(&mut f, finding)?;
-        f.write_all(b"\n")?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        for finding in findings {
+            serde_json::to_writer(&mut f, finding)?;
+            f.write_all(b"\n")?;
+        }
+        f.flush()?;
+        f.sync_all()?; // durable on disk before the rename swings the pointer
     }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
     Ok(())
 }
 
@@ -227,9 +272,10 @@ diff --git a/src/lib.rs b/src/lib.rs
     #[tokio::test]
     async fn stub_produces_grounded_findings() {
         let files = diff::parse(SAMPLE);
-        let f = collect(&StubCritic, "rust-lang/rust", 1, "sess1", &files, &mut limiter())
+        let (f, failures) = collect(&StubCritic, "rust-lang/rust", 1, "sess1", &files, &mut limiter())
             .await
             .unwrap();
+        assert_eq!(failures, 0);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].model_version, "stub");
         assert!(f[0].grounded, "stub cites a real added line, so grounded");
@@ -249,17 +295,17 @@ diff --git a/src/lib.rs b/src/lib.rs
     #[tokio::test]
     async fn finding_id_is_stable_across_sessions() {
         let files = diff::parse(SAMPLE);
-        let a = collect(&StubCritic, "r", 1, "sess1", &files, &mut limiter())
+        let (a, _) = collect(&StubCritic, "r", 1, "sess1", &files, &mut limiter())
             .await
             .unwrap();
-        let b = collect(&StubCritic, "r", 1, "sess2", &files, &mut limiter())
+        let (b, _) = collect(&StubCritic, "r", 1, "sess2", &files, &mut limiter())
             .await
             .unwrap();
         // Same critic + hunk + comment ⇒ same id, regardless of session — so a
         // re-run can dedupe and preserve labels.
         assert_eq!(a[0].finding_id, b[0].finding_id);
         // Different PR ⇒ different id.
-        let c = collect(&StubCritic, "r", 2, "sess1", &files, &mut limiter())
+        let (c, _) = collect(&StubCritic, "r", 2, "sess1", &files, &mut limiter())
             .await
             .unwrap();
         assert_ne!(a[0].finding_id, c[0].finding_id);
@@ -273,13 +319,13 @@ diff --git a/src/lib.rs b/src/lib.rs
         let files = diff::parse(SAMPLE);
 
         // First run: capture, then a human labels the finding.
-        let mut f = collect(&StubCritic, "r", 1, "sess1", &files, &mut limiter())
+        let (mut f, _) = collect(&StubCritic, "r", 1, "sess1", &files, &mut limiter())
             .await
             .unwrap();
         merge(&path, &f).unwrap();
         f[0].human = Some(HumanLabel {
             verdict: Verdict::Accept,
-            is_design_problem: true,
+            is_design_problem: Some(true),
             severity: Some("medium".into()),
             note: None,
             judged_at: "now".into(),
@@ -288,7 +334,7 @@ diff --git a/src/lib.rs b/src/lib.rs
         save(&path, &f).unwrap();
 
         // Second run of the *same* review: must not duplicate, must keep the label.
-        let again = collect(&StubCritic, "r", 1, "sess2", &files, &mut limiter())
+        let (again, _) = collect(&StubCritic, "r", 1, "sess2", &files, &mut limiter())
             .await
             .unwrap();
         let merged = merge(&path, &again).unwrap();

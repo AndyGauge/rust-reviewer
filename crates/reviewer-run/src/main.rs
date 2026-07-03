@@ -141,7 +141,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
         args.concurrency_max,
         args.concurrency_start,
     );
-    let found = if let Some(endpoint) = &args.endpoint {
+    let (found, failures) = if let Some(endpoint) = &args.endpoint {
         eprintln!("  critic: {} [{}]", endpoint, args.model_version);
         let critic = critic::HttpCritic::new(
             endpoint,
@@ -161,6 +161,11 @@ async fn review(args: ReviewArgs) -> Result<()> {
         found.len(),
         grounded,
     );
+    if failures > 0 {
+        eprintln!(
+            "  ! {failures} hunk(s) failed to review after retry — this run is INCOMPLETE"
+        );
+    }
     eprintln!(
         "  concurrency: learned ~{} in [{}, {}] (min service {:.0}ms, {} adjustments)",
         limiter.settled(),
@@ -189,7 +194,7 @@ async fn review(args: ReviewArgs) -> Result<()> {
         .filter(|f| f.pr == Some(args.pr) && f.repo == args.repo)
         .collect();
 
-    let html = render::report(&pr, &files, &this_pr);
+    let html = render::report(&pr, &files, &this_pr, failures);
     std::fs::write(&args.out, &html)
         .with_context(|| format!("writing {}", args.out.display()))?;
     eprintln!("report   -> {}", args.out.display());
@@ -236,9 +241,9 @@ fn label(args: LabelArgs) -> Result<()> {
         let Some(line) = lines.next() else { break };
         let choice = line?.trim().to_lowercase();
         let (verdict, is_design) = match choice.chars().next() {
-            Some('a') => (Verdict::Accept, true),
-            Some('r') => (Verdict::Reject, false),
-            Some('u') => (Verdict::Unsure, false),
+            Some('a') => (Verdict::Accept, Some(true)),
+            Some('r') => (Verdict::Reject, Some(false)),
+            Some('u') => (Verdict::Unsure, None), // declined to judge — no label
             Some('q') => break,
             _ => {
                 println!("   (skipped)\n");

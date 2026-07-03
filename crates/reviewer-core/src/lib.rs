@@ -45,16 +45,7 @@ impl ReviewComment {
     }
 
     pub fn login(&self) -> &str {
-        self.user.as_deref_login().unwrap_or("")
-    }
-}
-
-trait OptionUserExt {
-    fn as_deref_login(&self) -> Option<&str>;
-}
-impl OptionUserExt for Option<User> {
-    fn as_deref_login(&self) -> Option<&str> {
-        self.as_ref().map(|u| u.login.as_str())
+        self.user.as_ref().map(|u| u.login.as_str()).unwrap_or("")
     }
 }
 
@@ -154,7 +145,9 @@ pub struct CriticFinding {
 pub struct HumanLabel {
     pub verdict: Verdict,
     /// Whether this is genuinely a *design* problem (vs a nit or a non-issue).
-    pub is_design_problem: bool,
+    /// `None` for `Unsure` — don't bake a confident negative into the judge's
+    /// training data for a case the human explicitly declined to judge.
+    pub is_design_problem: Option<bool>,
     #[serde(default)]
     pub severity: Option<String>,
     #[serde(default)]
