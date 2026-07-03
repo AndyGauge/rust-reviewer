@@ -1,0 +1,15 @@
+# Path B training stack (Python escape hatch — see docs/training-path-b.md).
+# Pin exact versions on the box after `pip freeze`; left loose here because
+# Qwen3.6 support landed recently and the floor keeps moving.
+#
+# IMPORTANT: install the ARM64 (aarch64) + CUDA(Blackwell, sm_121) build of
+# torch from NVIDIA's index on the GB10 — the default PyPI wheel will not match.
+# Verify with: python -c "import torch; print(torch.cuda.is_available())"
+
+torch            # ARM64 + CUDA build matching the DGX OS CUDA toolkit
+transformers     # must be new enough to know the Qwen3.6 hybrid arch (or trust_remote_code)
+trl              # SFTTrainer
+peft             # LoRA
+datasets         # JSONL loading
+accelerate       # device placement
+sentencepiece    # tokenizer dep for some Qwen variants

@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# Training data — large, regenerable from reviewer-extract/prepare, not source.
+# raw/ = crawled GitHub comments; prepared/ = the SFT JSONL.
+/data/
+
+# Model artifacts, checkpoints, adapters, metrics, and run logs (live on the box)
+/train/out/
+/train/.venv/
+*.log
+*.checkpoint
+
+# Python caches (Path B training scripts)
+__pycache__/
+*.pyc
+
+# Local review-harness output
+/review.html
+*.review.html
+
+# macOS
+.DS_Store
