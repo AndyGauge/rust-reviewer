@@ -7,10 +7,12 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use reviewer_core::{CriticFinding, Verdict};
+
 use crate::diff::{FileDiff, LineKind};
 use crate::github::FetchedPr;
 
-pub fn report(pr: &FetchedPr, files: &[FileDiff]) -> String {
+pub fn report(pr: &FetchedPr, files: &[FileDiff], findings: &[CriticFinding]) -> String {
     let m = &pr.meta;
     let hunks: usize = files.iter().map(|f| f.hunks.len()).sum();
     let author = m.user.as_ref().map(|u| u.login.as_str()).unwrap_or("?");
@@ -21,6 +23,11 @@ pub fn report(pr: &FetchedPr, files: &[FileDiff]) -> String {
         if let Some(p) = c.path.as_deref() {
             by_file.entry(p).or_default().push(c);
         }
+    }
+    // Group critic findings by file path too.
+    let mut critic_by_file: BTreeMap<&str, Vec<&CriticFinding>> = BTreeMap::new();
+    for f in findings {
+        critic_by_file.entry(f.path.as_str()).or_default().push(f);
     }
 
     let mut s = String::new();
@@ -52,14 +59,30 @@ pub fn report(pr: &FetchedPr, files: &[FileDiff]) -> String {
         let _ = write!(s, "<div class=\"cmt\">{}</div>\n", esc(&truncate(body, 1200)));
     }
 
-    // Model-review placeholder — the deterministic spine is real, this isn't yet.
+    // Critic summary. Distinguishes the stub from a real adapter, and reports
+    // grounding + how much has been human-judged (the flywheel's fill level).
+    let model = findings
+        .first()
+        .map(|f| f.model_version.as_str())
+        .unwrap_or("none");
+    let grounded = findings.iter().filter(|f| f.grounded).count();
+    let judged = findings.iter().filter(|f| f.human.is_some()).count();
+    let stub_note = if model == "stub" {
+        " <b>(stub — no adapter wired yet)</b>"
+    } else {
+        ""
+    };
     let _ = write!(
         s,
-        "<div class=\"banner\">Model review: <b>pending</b> — deterministic spine only \
-         (fetch → segment → render). {} files, {} hunks segmented and ready to send to \
-         the adapter.</div>\n",
+        "<div class=\"banner\">Critic: <code>{}</code>{} · {} findings over {} files / \
+         {} hunks · {} grounded · {} human-judged</div>\n",
+        esc(model),
+        stub_note,
+        findings.len(),
         files.len(),
         hunks,
+        grounded,
+        judged,
     );
 
     // General discussion (issue comments).
@@ -100,6 +123,35 @@ pub fn report(pr: &FetchedPr, files: &[FileDiff]) -> String {
                     esc(who),
                     ln.map(|n| format!(" <span class=\"lno\">L{n}</span>")).unwrap_or_default(),
                     esc(&truncate(&c.body, 600)),
+                );
+            }
+        }
+
+        // Critic findings for this file — the persisted record, rendered.
+        if let Some(cf) = critic_by_file.get(f.path.as_str()) {
+            for finding in cf {
+                let anchor = finding
+                    .cited_line
+                    .map(|n| format!(" <span class=\"lno\">L{n}</span>"))
+                    .unwrap_or_default();
+                let ground = if finding.grounded {
+                    ""
+                } else {
+                    " <span class=\"tag ungrounded\">ungrounded</span>"
+                };
+                let verdict = match finding.human.as_ref().map(|h| h.verdict) {
+                    Some(Verdict::Accept) => " <span class=\"tag accept\">accepted</span>",
+                    Some(Verdict::Reject) => " <span class=\"tag reject\">rejected</span>",
+                    Some(Verdict::Unsure) => " <span class=\"tag unsure\">unsure</span>",
+                    None => " <span class=\"tag pending\">unjudged</span>",
+                };
+                let _ = write!(
+                    s,
+                    "<div class=\"cmt critic\"><span class=\"who\">critic</span>{}{}{} {}</div>\n",
+                    anchor,
+                    ground,
+                    verdict,
+                    esc(&truncate(&finding.critic_comment, 800)),
                 );
             }
         }
@@ -165,7 +217,12 @@ h2.file{margin-top:2rem;border-top:1px solid #e0e0e2;padding-top:1rem}
 .badge.modified{background:#0969da}.badge.renamed{background:#8250df}
 .cmt{background:#f6f8fa;border-left:3px solid #8250df;padding:.4rem .7rem;margin:.4rem 0;border-radius:0 6px 6px 0}
 .cmt.human{border-left-color:#0969da}
+.cmt.critic{border-left-color:#1a7f37;background:#f2fbf4}
 .who{font-weight:600;margin-right:.5em}.lno{color:#999;font-size:.85em}
+.tag{font-size:.7rem;padding:.1em .4em;border-radius:4px;margin-right:.3em}
+.tag.ungrounded{background:#ffe0e0;color:#82071e}
+.tag.accept{background:#d3f8d3;color:#0a5223}.tag.reject{background:#ffe0e0;color:#82071e}
+.tag.unsure{background:#fff3cd;color:#7a5c00}.tag.pending{background:#eee;color:#666}
 table.hunk{border-collapse:collapse;width:100%;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;\
 margin:.5rem 0;overflow-x:auto;display:block}
 table.hunk td{padding:0 .5em;white-space:pre;vertical-align:top}
