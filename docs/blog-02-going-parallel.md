@@ -14,10 +14,9 @@ req/sec; we're doing ~1/sec; so we're near the rate-limit ceiling, and
 parallelizing won't help — you'd just burn the hourly budget in minutes and then
 sleep. I even wrote out the math. It was tidy. It was wrong.
 
-What tipped me off was a number I hadn't actually measured: a collaborator
-pointed out the crawl had made only ~1,300 requests in *two hours*. That's ~650
-req/hr — about **13% of the budget**, not 70%. My "we're near the ceiling" story
-couldn't be true.
+What tipped me off was a number I hadn't actually measured: the crawl had made
+only ~1,300 requests in *two hours*. That's ~650 req/hr — about **13% of the
+budget**, not 70%. My "we're near the ceiling" story couldn't be true.
 
 ## The real answer, measured
 

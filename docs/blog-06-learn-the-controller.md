@@ -63,11 +63,13 @@ requests that the server always has a full batch to chew.
 
 ## The number isn't a number
 
-So: sweep the concurrency, find the best value, hardcode it. That was my next
-plan, and my collaborator killed it with one sentence — *I want the machine to
-learn its batch number through experimentation.*
+So: sweep the concurrency, find the best value, hardcode it. That was where the
+AI pair and I were heading — and here's the flip side of letting an AI draft your
+plans, the one part 5 only showed going one direction: sometimes *you're* the one
+who has to supply the insight it missed. I stopped us with one sentence — *I want
+the machine to learn its batch number through experimentation.*
 
-He was right, and here's why the swept-and-hardcoded number is a trap. The
+And here's why the swept-and-hardcoded number is a trap. The
 optimal concurrency depends on how much KV-cache each request needs, which
 depends on prompt and output length — and those vary wildly hunk to hunk, PR to
 PR. A number I measure on today's PR is stale on tomorrow's. The thing that's
