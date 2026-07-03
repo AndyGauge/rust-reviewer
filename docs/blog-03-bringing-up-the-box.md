@@ -133,10 +133,6 @@ The frontier-hardware stack had one more missing piece — the Python dev header
 Triton needs to build its CUDA shims. `apt install python3.12-dev`, and the fast
 path compiles.
 
-The frontier-hardware stack had one more missing piece — the Python dev headers
-Triton needs to build its CUDA shims. `apt install python3.12-dev`, and the fast
-path compiles.
-
 ## Lie #5: the OOM that a browser caused
 
 With the fast path built, I fired a throughput probe: 25 real steps, so I could

@@ -1,5 +1,13 @@
 # Rust ML capability matrix (for an all-Rust LoRA pipeline)
 
+> **Status: partly superseded.** This matrix captures the early survey that
+> motivated the *all-Rust* ambition and the Path A vs Path B split. The training
+> decision has since been made — **Path B** (a Python baseline on **Qwen3.6-27B**,
+> not the Qwen3-Coder-30B-A3B floated below) is what's actually running; see
+> [`training-path-b.md`](training-path-b.md) and blogs 3–6. Read this for the
+> ecosystem lay-of-the-land and the crate-gap map, not for the current base-model
+> or training choice.
+
 An honest assessment, as of mid-2026, of what the Rust ecosystem can do at each
 stage of building a LoRA fine-tune — and where the gaps are (i.e. crate
 opportunities). Target: a design-review assistant LoRA on top of a ~30B Qwen3

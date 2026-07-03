@@ -139,12 +139,12 @@ call, is where the safety question actually lives.
 
 ## The theme
 
-The lesson mutates one more time. Part 2: measure before you optimize. Part 3:
-the label is not the operation. Part 4: watch the curve you didn't ask for. Part
-5: the model is one box, so make everything around it testable. Part 6: **even a
-measurement you earned is an assumption once the operation changes — and the most
-honest answer to "what's the right number?" is often to build the thing that
-never stops measuring it.**
+This project's one lesson keeps changing costume. It arrived as *measure before
+you optimize*, came back as *the label is not the operation*, and turned up again
+as *watch the curve you didn't ask for*. Here it wears its sharpest form: **even
+a measurement you earned becomes an assumption the moment the operation changes —
+and the most honest answer to "what's the right number?" is often to build the
+thing that never stops measuring it.**
 
 I spent this project learning to distrust confident numbers, including my own.
 The natural endpoint of that distrust isn't a better guess; it's handing the
