@@ -1,0 +1,52 @@
+# Training log — Path B reviewer LoRA
+
+The living record of the run. Blog 4 is a frozen *snapshot* (written at ~21%);
+this is the rolling table, updated when the run is checked. If you want the story,
+read the blog; if you want the numbers, read here.
+
+## Run config
+
+| | |
+|---|---|
+| Base model | Qwen3.6-27B (dense, bf16) |
+| Method | LoRA SFT, rank 32, α 64, all-linear |
+| Hyperparams | batch 1 · grad-accum 32 · seq 2048 · lr 1e-4 cosine · warmup 0.03 |
+| Schedule | 3 epochs = **2790 optimizer steps** |
+| Hardware | NVIDIA GB10 (GX10, 128 GB unified), CUDA 13.0 |
+| Train set | rust-0.4.jsonl — 29,745 design examples (rust-lang/rust) |
+| Eval set | cookbook-0.4.jsonl — 123 examples (rust-lang-nursery/rust-cookbook), **out-of-domain on purpose** |
+| Started | 2026-07-02 |
+
+## Trajectory
+
+Eval runs every 100 steps against the cookbook slice (a different distribution
+from training — the point is to watch skill transfer, not corpus memorization).
+"Eval loss" / "eval acc" are from the most recent eval at each check.
+
+| Elapsed | Step (%) | Epoch | Train loss | grad_norm | Eval loss | Eval tok-acc | Notes |
+|---|---|---|---|---|---|---|---|
+| 0:00 | 0 | 0.00 | 4.36 | 17.4 | — | — | cold start (smoke test) |
+| 2:53 | 119 (4%) | 0.11 | 1.86 | ~0.6 | 2.04 | 0.569 | warmup done; register installed |
+| 14:01 | 574 (21%) | 0.54 | 1.80 | ~0.6 | 2.03 | 0.573 | **blog 4 snapshot** |
+| 16:58 | 698 (25%) | 0.66 | 1.79 | ~0.6 | 2.04 | 0.570 | — |
+| 19:33 | 803 (29%) | 0.86 | 1.79 | ~0.6 | 2.03 | 0.574 | — |
+| 22:28 | 923 (33%) | 0.97 | 1.78 | 0.74 | 2.029 | 0.573 | end of epoch 1 |
+
+## Reading it
+
+- **Train loss** fell fast (4.36 → ~1.8 in the first few hundred steps — the
+  register got installed) and is now grinding down slowly. Normal shape.
+- **Eval loss** is flat-to-slightly-falling (2.04 → 2.029) and, crucially, **not
+  rising** — no overfitting. The gap to train loss (~1.8 vs ~2.03) is expected:
+  the eval set is out-of-domain (cookbook, not rustc). The story is "learning the
+  skill slowly," not "memorizing the corpus."
+- **Checkpoints** saved every 200 steps (`save_total_limit=3`, rolling): latest
+  on disk are `checkpoint-400/600/800`.
+
+## Status
+
+- **Alive**, GPU ~96% / 84°C, ~44h remaining (~2790 steps at ~85 s/step).
+- Next narrative-worthy events: (1) eval loss *turning upward* = overfitting
+  alarm (would warrant a note); (2) run completion = Part 7, the verdict.
+- `baseline_metrics.json` (wall-clock, peak mem) lands at the end — the reference
+  numbers for the eventual all-Rust Path A comparison.
