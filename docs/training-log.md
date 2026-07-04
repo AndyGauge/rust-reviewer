@@ -39,10 +39,13 @@ from training — the point is to watch skill transfer, not corpus memorization)
 
 - **Train loss** fell fast (4.36 → ~1.8 in the first few hundred steps — the
   register got installed) and is now grinding down slowly. Normal shape.
-- **Eval loss** is flat-to-slightly-falling (2.04 → 2.029) and, crucially, **not
-  rising** — no overfitting. The gap to train loss (~1.8 vs ~2.03) is expected:
-  the eval set is out-of-domain (cookbook, not rustc). The story is "learning the
-  skill slowly," not "memorizing the corpus."
+- **Eval loss** fell gently through epoch 1 to a **minimum of 2.029** (step 923),
+  then began a slow, steady drift *upward* in epoch 2 (→ ~2.063) while train loss
+  kept edging down — **mild overfitting**, confirmed as a trend but undramatic.
+  The gap to train loss is partly expected (the eval set is out-of-domain —
+  cookbook, not rustc). Net: epoch 1 holds the eval optimum so far; whether the
+  final (epoch 3, LR→0) recovers or the epoch-1 adapter wins is decided by
+  running both on real diffs, not by this curve.
 - **Checkpoints** saved every 200 steps (`save_total_limit=3`, rolling). To
   compare epochs later, `checkpoint-1000` (epoch ~1.08) has been copied to
   `out/keep/checkpoint-1000-epoch1` so the rolling window can't delete it — if
