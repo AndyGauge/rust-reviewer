@@ -33,6 +33,7 @@ from training — the point is to watch skill transfer, not corpus memorization)
 | 22:28 | 923 (33%) | 0.97 | 1.78 | 0.74 | 2.029 | 0.573 | end of epoch 1 |
 | 27:01 | 1111 (40%) | 1.18 | 1.60 | 0.95 | 2.054 | 0.572 | **eval ticks UP** (2.03→2.054) as epoch 2 starts, train drops hard — first overfitting sign (1 point; watch next eval) |
 | 37:19 | 1536 (55%) | 1.61 | 1.62 | 0.73 | 2.056 | 0.569 | eval **plateaued** (2.054→2.061→2.059→2.056), train flat ~1.6 — mild stable gap, NOT runaway overfitting; epoch-1 still holds eval min by ~0.03 |
+| 43:53 | 1807 (65%) | 1.94 | 1.58 | 0.77 | 2.063 | 0.569 | eval drifting up slowly & steadily (2.056→2.063) — mild overfitting confirmed as a trend; epoch-1 (2.029) still the eval min; epoch 3 (LR→0) the open question |
 
 ## Reading it
 
