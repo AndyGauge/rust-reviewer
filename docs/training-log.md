@@ -31,6 +31,7 @@ from training — the point is to watch skill transfer, not corpus memorization)
 | 16:58 | 698 (25%) | 0.66 | 1.79 | ~0.6 | 2.04 | 0.570 | — |
 | 19:33 | 803 (29%) | 0.86 | 1.79 | ~0.6 | 2.03 | 0.574 | — |
 | 22:28 | 923 (33%) | 0.97 | 1.78 | 0.74 | 2.029 | 0.573 | end of epoch 1 |
+| 27:01 | 1111 (40%) | 1.18 | 1.60 | 0.95 | 2.054 | 0.572 | **eval ticks UP** (2.03→2.054) as epoch 2 starts, train drops hard — first overfitting sign (1 point; watch next eval) |
 
 ## Reading it
 
@@ -40,8 +41,10 @@ from training — the point is to watch skill transfer, not corpus memorization)
   rising** — no overfitting. The gap to train loss (~1.8 vs ~2.03) is expected:
   the eval set is out-of-domain (cookbook, not rustc). The story is "learning the
   skill slowly," not "memorizing the corpus."
-- **Checkpoints** saved every 200 steps (`save_total_limit=3`, rolling): latest
-  on disk are `checkpoint-400/600/800`.
+- **Checkpoints** saved every 200 steps (`save_total_limit=3`, rolling). To
+  compare epochs later, `checkpoint-1000` (epoch ~1.08) has been copied to
+  `out/keep/checkpoint-1000-epoch1` so the rolling window can't delete it — if
+  the eval uptick becomes a trend, this near-epoch-1 adapter may beat the final.
 
 ## Status
 
