@@ -36,6 +36,7 @@ from training — the point is to watch skill transfer, not corpus memorization)
 | 43:53 | 1807 (65%) | 1.94 | 1.58 | 0.77 | 2.063 | 0.569 | eval drifting up slowly & steadily (2.056→2.063) — mild overfitting confirmed as a trend; epoch-1 (2.029) still the eval min; epoch 3 (LR→0) the open question |
 | 49:58 | 2058 (74%) | 2.15 | 1.24 | 1.26 | 2.141 | 0.565 | **epoch 3 overfits clearly**: train loss collapses (1.58→1.24, acc→0.67), eval JUMPS (2.065→2.141). epoch-1 firmly the eval optimum; final adapter generalizing worse |
 | 62:04 | 2555 (92%) | 2.69 | 1.23 | 1.30 | 2.153 | 0.564 | epoch 3 eval plateaus ~2.15 (vs epoch-1 2.029), LR→0, no recovery — overfitting settled; epoch-1 is the keeper. ~6h to finish |
+| 67:48 | 2790 (100%) | 3.00 | — | — | 2.151 | 0.563 | **DONE.** 67.8h wall-clock, peak mem 68.4 GB, total 7.0e18 FLOPs. Final (epoch-3) adapter saved; all 3 epoch adapters in keep/. epoch-1 (eval 2.029) is the eval optimum |
 
 ## Reading it
 
@@ -56,7 +57,7 @@ from training — the point is to watch skill transfer, not corpus memorization)
 
 ## Status
 
-- **Alive**, GPU ~96% / 84°C, ~44h remaining (~2790 steps at ~85 s/step).
+- **COMPLETE** (2026-07-05): 2790/2790 steps, 67.8 h wall-clock, peak mem **68.4 GB** (batch-1 27B fit comfortably in the 128 GB pool), 7.0e18 FLOPs. Box idle.
 - Next narrative-worthy events: (1) eval loss *turning upward* = overfitting
   alarm (would warrant a note); (2) run completion = Part 7, the verdict.
 - `baseline_metrics.json` (wall-clock, peak mem) lands at the end — the reference
