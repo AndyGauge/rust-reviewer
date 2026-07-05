@@ -47,10 +47,11 @@ from training — the point is to watch skill transfer, not corpus memorization)
   cookbook, not rustc). Net: epoch 1 holds the eval optimum so far; whether the
   final (epoch 3, LR→0) recovers or the epoch-1 adapter wins is decided by
   running both on real diffs, not by this curve.
-- **Checkpoints** saved every 200 steps (`save_total_limit=3`, rolling). To
-  compare epochs later, `checkpoint-1000` (epoch ~1.08) has been copied to
-  `out/keep/checkpoint-1000-epoch1` so the rolling window can't delete it — if
-  the eval uptick becomes a trend, this near-epoch-1 adapter may beat the final.
+- **Checkpoints** saved every 200 steps (`save_total_limit=3`, rolling). For the
+  epoch-1-vs-2-vs-3 comparison, two are preserved in `out/keep/` (safe from the
+  rolling window): `checkpoint-1000-epoch1` (eval ~2.054, near the 2.029 min) and
+  `checkpoint-1800-epoch2` (eval ~2.063). The final epoch-3 adapter auto-saves at
+  the end. The eval curve says epoch 1 generalizes best — the diff test decides.
 
 ## Status
 
