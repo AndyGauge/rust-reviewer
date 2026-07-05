@@ -24,3 +24,6 @@ findings.jsonl
 
 # macOS
 .DS_Store
+
+# Path A oracle dumps (regenerable from oracle_dump.py; can be large)
+oracle_*.safetensors

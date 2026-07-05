@@ -5,6 +5,7 @@ members = [
     "crates/reviewer-extract",
     "crates/reviewer-prepare",
     "crates/reviewer-run",
+    "crates/reviewer-train",
 ]
 
 [workspace.package]
