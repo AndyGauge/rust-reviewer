@@ -18,6 +18,7 @@ mod generate;
 mod mixer;
 mod model;
 mod rope;
+mod serve;
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -236,6 +237,29 @@ enum Cmd {
         #[arg(long, default_value_t = 128)]
         max_new_tokens: usize,
     },
+    /// Serve an OpenAI-compatible endpoint (POST /v1/chat/completions) so
+    /// `reviewer-run --endpoint` drives the Rust reviewer over the network —
+    /// the candle twin of train/serve.py. Single-stream (one GPU).
+    Serve {
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        bf16: bool,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
+        #[arg(long, default_value = "reviewer")]
+        model_name: String,
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        #[arg(long, default_value_t = 256)]
+        max_new_tokens: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -264,6 +288,9 @@ fn main() -> Result<()> {
         }
         Cmd::VerifyBatch { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
             verify_batch(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        }
+        Cmd::Serve { weights, tokenizer, config, bf16, adapter, lora_scale, model_name, port, max_new_tokens } => {
+            serve::serve(&weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, &tokenizer, model_name, port, max_new_tokens)
         }
         Cmd::Bench { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
             bench(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
