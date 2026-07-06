@@ -10,8 +10,11 @@ anyhow.workspace = true
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
 clap.workspace = true
+reviewer-core = { path = "../reviewer-core" }
 safetensors = "0.8.0"
+serde = { workspace = true }
 serde_json.workspace = true
+tokenizers = "0.23.1"
 
 [features]
 # Enable candle's CUDA backend (GPU inference/training). Build with

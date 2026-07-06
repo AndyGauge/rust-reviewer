@@ -28,3 +28,7 @@ findings.jsonl
 # Path A oracle dumps (regenerable from oracle_dump.py; can be large)
 oracle_*.safetensors
 *_synth.safetensors
+
+# Tokenizer/config files copied down from the box for offline dev (regenerable)
+/.models/
+/train/.venv-tok/

@@ -9,6 +9,7 @@
 //! This skeleton just loads and inspects the oracle — the first Rust code to
 //! touch both candle and the ground-truth tensors. The model port builds on it.
 
+mod chat;
 mod config;
 mod delta;
 mod mixer;
@@ -75,6 +76,26 @@ enum Cmd {
         #[arg(long, default_value_t = 2.0)]
         lora_scale: f64,
     },
+    /// Write the sample (system, user) chat fixture as JSON — the single
+    /// source of truth fed to both the Rust template renderer and the Python
+    /// oracle script, so they tokenize identical strings.
+    DumpChatFixture {
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Verify our hardcoded chat-template + tokenizer against a Python oracle
+    /// (`train/chat_template_oracle.py`) built from the same fixture (Stage 4a).
+    VerifyChatTemplate {
+        /// The (system, user) JSON from `dump-chat-fixture`.
+        #[arg(long)]
+        fixture: PathBuf,
+        /// `tokenizer.json` from the HF snapshot.
+        #[arg(long)]
+        tokenizer: PathBuf,
+        /// Oracle safetensors (one "input_ids" tensor) from the Python side.
+        #[arg(long)]
+        oracle: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -87,7 +108,37 @@ fn main() -> Result<()> {
         Cmd::VerifyModel { oracle, weights, config, bf16, adapter, lora_scale } => {
             verify_model(&oracle, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale)
         }
+        Cmd::DumpChatFixture { out } => chat::ChatFixture::sample().save(&out),
+        Cmd::VerifyChatTemplate { fixture, tokenizer, oracle } => {
+            verify_chat_template(&fixture, &tokenizer, &oracle)
+        }
     }
+}
+
+fn verify_chat_template(fixture: &PathBuf, tokenizer: &PathBuf, oracle: &PathBuf) -> Result<()> {
+    let fx = chat::ChatFixture::load(fixture)?;
+    let text = chat::render_prompt(&fx.system, &fx.user);
+    let tok = chat::load_tokenizer(tokenizer)?;
+    let got = chat::encode(&tok, &text)?;
+
+    let o = safetensors::load(oracle, &Device::Cpu)
+        .with_context(|| format!("loading {}", oracle.display()))?;
+    let exp: Vec<i64> = o["input_ids"].to_vec1()?;
+
+    println!("rendered prompt ({} chars):\n{text}", text.len());
+    println!("rust ids   ({}): {got:?}", got.len());
+    println!("python ids ({}): {exp:?}", exp.len());
+
+    let matches = got.len() == exp.len() && got.iter().zip(&exp).all(|(a, b)| *a as i64 == *b);
+    if !matches {
+        if let Some((i, (a, b))) = got.iter().zip(&exp).enumerate().find(|(_, (a, b))| **a as i64 != **b) {
+            println!("  first mismatch at index {i}: rust={a} python={b}");
+        } else if got.len() != exp.len() {
+            println!("  length mismatch: rust={} python={}", got.len(), exp.len());
+        }
+    }
+    println!("  {}", if matches { "MATCH ✓" } else { "MISMATCH ✗" });
+    Ok(())
 }
 
 fn verify_model(
