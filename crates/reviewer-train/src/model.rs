@@ -112,7 +112,8 @@ fn attention(
 
     let scale = (hd as f64).powf(-0.5);
     let attn = query.matmul(&key.transpose(2, 3)?.contiguous()?)?.affine(scale, 0.0)?; // [b,nh,s,s]
-    let attn = attn.broadcast_add(&causal_mask(s, x.device())?)?;
+    let mask = causal_mask(s, x.device())?.to_dtype(attn.dtype())?;
+    let attn = attn.broadcast_add(&mask)?;
     let attn = softmax(&attn, D::Minus1)?;
     let out = attn.matmul(&value)?; // [b,nh,s,hd]
     let out = out.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?; // [b,s,4096]
@@ -140,7 +141,7 @@ pub fn decoder_layer_full(
 
 /// Load the language-model + lm_head weights from a directory of sharded
 /// safetensors onto `device`, cast to f32 (the vision tower is skipped).
-pub fn load_weights(dir: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
+pub fn load_weights(dir: &Path, device: &Device, dtype: DType) -> Result<HashMap<String, Tensor>> {
     let mut w = HashMap::new();
     for entry in std::fs::read_dir(dir).map_err(candle_core::Error::wrap)? {
         let path = entry.map_err(candle_core::Error::wrap)?.path();
@@ -149,7 +150,7 @@ pub fn load_weights(dir: &Path, device: &Device) -> Result<HashMap<String, Tenso
         }
         for (k, v) in safetensors::load(&path, device)? {
             if k.starts_with("model.language_model.") || k.starts_with("lm_head.") {
-                w.insert(k, v.to_dtype(DType::F32)?);
+                w.insert(k, v.to_dtype(dtype)?);
             }
         }
     }
@@ -169,6 +170,10 @@ pub fn full_model_forward(
     let embed = &w["model.language_model.embed_tokens.weight"]; // [vocab, hidden]
     let ids = input_ids.flatten_all()?.to_dtype(DType::U32)?;
     let mut x = embed.index_select(&ids, 0)?.reshape((b, s, cfg.hidden))?;
+
+    // RoPE tables must match the model's dtype (bf16 for the 27B).
+    let cos = &cos.to_dtype(x.dtype())?;
+    let sin = &sin.to_dtype(x.dtype())?;
 
     for i in 0..cfg.n_layers {
         let prefix = format!("model.language_model.layers.{i}.");

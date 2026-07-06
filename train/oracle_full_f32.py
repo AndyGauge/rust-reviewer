@@ -7,15 +7,24 @@ Saves input_ids, RoPE cos/sin, per-layer hidden states, and the final logits
 (+ argmax). The candle full model loads the real weights and must reproduce
 these — especially the argmax at every position.
 """
+import argparse
+
 import torch
 from safetensors.torch import save_file
 from transformers import AutoModelForImageTextToText, AutoTokenizer
 from transformers.models.qwen3_5 import modeling_qwen3_5 as M
 
-MODEL = "Qwen/Qwen3.5-9B"
-PROMPT = "fn main() {\n    let x = "
+ap = argparse.ArgumentParser()
+ap.add_argument("--model", default="Qwen/Qwen3.5-9B")
+ap.add_argument("--out", default="oracle_full_f32.safetensors")
+ap.add_argument("--bf16", action="store_true", help="run in bf16 (for the 27B)")
+args = ap.parse_args()
 
-model = AutoModelForImageTextToText.from_pretrained(MODEL, dtype=torch.float32, device_map={"": 0})
+MODEL = args.model
+PROMPT = "fn main() {\n    let x = "
+DTYPE = torch.bfloat16 if args.bf16 else torch.float32
+
+model = AutoModelForImageTextToText.from_pretrained(MODEL, dtype=DTYPE, device_map={"": 0})
 
 
 class PureGatedNorm(torch.nn.Module):
@@ -25,11 +34,13 @@ class PureGatedNorm(torch.nn.Module):
         self.eps = eps
 
     def forward(self, h, gate):
+        dt = h.dtype
         h = h.float()
         v = h.pow(2).mean(-1, keepdim=True)
         h = h * torch.rsqrt(v + self.eps)
-        h = self.weight * h
-        return h * torch.nn.functional.silu(gate.float())
+        h = self.weight.float() * h
+        h = h * torch.nn.functional.silu(gate.float())
+        return h.to(dt)
 
 
 def rec_wrap(q, k, v, g, beta, initial_state=None, output_final_state=False,
@@ -47,7 +58,7 @@ for name, mod in model.named_modules():
     if name.endswith("rotary_emb") and "visual" not in name:
         rotary = mod
 
-tok = AutoTokenizer.from_pretrained(MODEL)
+tok = AutoTokenizer.from_pretrained(MODEL)  # noqa
 input_ids = tok(PROMPT, return_tensors="pt").input_ids.to("cuda")
 s = input_ids.shape[1]
 pos = torch.arange(s, device="cuda").unsqueeze(0)
@@ -68,6 +79,6 @@ tensors = {
 for i in range(min(9, len(hs))):
     tensors[f"hidden_{i}"] = hs[i][0].float().cpu().contiguous()
 
-save_file(tensors, "oracle_full_f32.safetensors")
+save_file(tensors, args.out)
 print(f"saved. seq={s} vocab={logits.shape[-1]} rope_dim={cos.shape[-1]}")
 print("argmax:", tensors["argmax"].tolist(), "->", repr(tok.decode(tensors["argmax"][-1])))

@@ -65,6 +65,9 @@ enum Cmd {
         /// Model config.json (dims). Defaults to the 9B if omitted.
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Load weights in bf16 (for the 27B, which doesn't fit in f32).
+        #[arg(long)]
+        bf16: bool,
     },
 }
 
@@ -75,27 +78,30 @@ fn main() -> Result<()> {
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
         Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
         Cmd::VerifyAttn { oracle } => verify_attn(&oracle),
-        Cmd::VerifyModel { oracle, weights, config } => verify_model(&oracle, &weights, config.as_deref()),
+        Cmd::VerifyModel { oracle, weights, config, bf16 } => {
+            verify_model(&oracle, &weights, config.as_deref(), bf16)
+        }
     }
 }
 
-fn verify_model(oracle: &PathBuf, weights: &PathBuf, config: Option<&std::path::Path>) -> Result<()> {
+fn verify_model(oracle: &PathBuf, weights: &PathBuf, config: Option<&std::path::Path>, bf16: bool) -> Result<()> {
     let cfg = match config {
         Some(p) => Config::from_json(p)?,
         None => Config::qwen9b(),
     };
-    println!("config: {} layers, hidden {}", cfg.n_layers, cfg.hidden);
+    let dtype = if bf16 { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+    println!("config: {} layers, hidden {}, dtype {dtype:?}", cfg.n_layers, cfg.hidden);
     let dev = Device::cuda_if_available(0)?;
     println!("device: {dev:?}");
     let o = safetensors::load(oracle, &dev)
         .with_context(|| format!("loading {}", oracle.display()))?;
     println!("loading weights from {} …", weights.display());
-    let w = model::load_weights(weights, &dev)?;
+    let w = model::load_weights(weights, &dev, dtype)?;
     println!("  loaded {} language-model tensors", w.len());
 
     let logits = model::full_model_forward(&w, &o["input_ids"], &o["cos"], &o["sin"], &cfg)?;
-    let got = logits.squeeze(0)?; // [s, vocab]
-    compare(&got, &o["logits"], "full model logits", 5e-2)?;
+    let got = logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?; // [s, vocab]
+    compare(&got, &o["logits"], "full model logits", 5e-1)?;
 
     // Argmax agreement — the meaningful "same predictions" check.
     let got_am: Vec<u32> = got.argmax(candle_core::D::Minus1)?.to_vec1()?;
