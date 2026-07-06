@@ -68,6 +68,12 @@ enum Cmd {
         /// Load weights in bf16 (for the 27B, which doesn't fit in f32).
         #[arg(long)]
         bf16: bool,
+        /// Merge a PEFT LoRA adapter_model.safetensors before running.
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// LoRA scale (alpha/r); epoch-1 adapter is 64/32 = 2.0.
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
     },
 }
 
@@ -78,13 +84,20 @@ fn main() -> Result<()> {
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
         Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
         Cmd::VerifyAttn { oracle } => verify_attn(&oracle),
-        Cmd::VerifyModel { oracle, weights, config, bf16 } => {
-            verify_model(&oracle, &weights, config.as_deref(), bf16)
+        Cmd::VerifyModel { oracle, weights, config, bf16, adapter, lora_scale } => {
+            verify_model(&oracle, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale)
         }
     }
 }
 
-fn verify_model(oracle: &PathBuf, weights: &PathBuf, config: Option<&std::path::Path>, bf16: bool) -> Result<()> {
+fn verify_model(
+    oracle: &PathBuf,
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+) -> Result<()> {
     let cfg = match config {
         Some(p) => Config::from_json(p)?,
         None => Config::qwen9b(),
@@ -96,8 +109,12 @@ fn verify_model(oracle: &PathBuf, weights: &PathBuf, config: Option<&std::path::
     let o = safetensors::load(oracle, &dev)
         .with_context(|| format!("loading {}", oracle.display()))?;
     println!("loading weights from {} …", weights.display());
-    let w = model::load_weights(weights, &dev, dtype)?;
+    let mut w = model::load_weights(weights, &dev, dtype)?;
     println!("  loaded {} language-model tensors", w.len());
+    if let Some(ad) = adapter {
+        println!("merging LoRA adapter {} …", ad.display());
+        model::apply_lora(&mut w, ad, lora_scale, dtype)?;
+    }
 
     let logits = model::full_model_forward(&w, &o["input_ids"], &o["cos"], &o["sin"], &cfg)?;
     let got = logits.squeeze(0)?.to_dtype(candle_core::DType::F32)?; // [s, vocab]

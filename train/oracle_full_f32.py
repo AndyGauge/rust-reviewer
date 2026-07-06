@@ -18,6 +18,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="Qwen/Qwen3.5-9B")
 ap.add_argument("--out", default="oracle_full_f32.safetensors")
 ap.add_argument("--bf16", action="store_true", help="run in bf16 (for the 27B)")
+ap.add_argument("--adapter", default=None, help="PEFT LoRA adapter dir to apply")
 args = ap.parse_args()
 
 MODEL = args.model
@@ -25,6 +26,9 @@ PROMPT = "fn main() {\n    let x = "
 DTYPE = torch.bfloat16 if args.bf16 else torch.float32
 
 model = AutoModelForImageTextToText.from_pretrained(MODEL, dtype=DTYPE, device_map={"": 0})
+if args.adapter:
+    from peft import PeftModel
+    model = PeftModel.from_pretrained(model, args.adapter)
 
 
 class PureGatedNorm(torch.nn.Module):

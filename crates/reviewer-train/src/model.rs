@@ -157,6 +157,40 @@ pub fn load_weights(dir: &Path, device: &Device, dtype: DType) -> Result<HashMap
     Ok(w)
 }
 
+/// Merge a PEFT LoRA adapter into the loaded base weights, in place. For each
+/// base weight `W[out,in]` with adapter `lora_A[r,in]` and `lora_B[out,r]`:
+/// `W += scale · (B @ A)`, `scale = alpha / r`. PEFT keys are
+/// `base_model.model.{stem}.lora_{A,B}.weight`; weights without a pair (embed,
+/// norms, lm_head) are left as the base.
+pub fn apply_lora(
+    w: &mut HashMap<String, Tensor>,
+    adapter: &Path,
+    scale: f64,
+    dtype: DType,
+) -> Result<()> {
+    let dev = w.values().next().unwrap().device().clone();
+    let a = safetensors::load(adapter, &dev)?;
+    let base_keys: Vec<String> = w.keys().cloned().collect();
+    let mut merged = 0usize;
+    for k in base_keys {
+        let Some(stem) = k.strip_suffix(".weight") else {
+            continue;
+        };
+        let ka = format!("base_model.model.{stem}.lora_A.weight");
+        let kb = format!("base_model.model.{stem}.lora_B.weight");
+        if let (Some(la), Some(lb)) = (a.get(&ka), a.get(&kb)) {
+            let la = la.to_dtype(dtype)?; // [r, in]
+            let lb = lb.to_dtype(dtype)?; // [out, r]
+            let delta = lb.matmul(&la)?.affine(scale, 0.0)?; // [out, in]
+            let merged_w = w[&k].add(&delta)?;
+            w.insert(k, merged_w);
+            merged += 1;
+        }
+    }
+    println!("  merged {merged} LoRA weights (scale {scale})");
+    Ok(())
+}
+
 /// The full model: embed → 32 hybrid layers (3 DeltaNet : 1 attention) → final
 /// norm → lm_head. Returns logits `[B, S, vocab]`.
 pub fn full_model_forward(
