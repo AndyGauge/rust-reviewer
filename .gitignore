@@ -32,3 +32,5 @@ oracle_*.safetensors
 # Tokenizer/config files copied down from the box for offline dev (regenerable)
 /.models/
 /train/.venv-tok/
+new_code_prompts.jsonl
+review_curated.jsonl
