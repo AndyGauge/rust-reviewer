@@ -52,6 +52,15 @@ enum Cmd {
         #[arg(long)]
         oracle: PathBuf,
     },
+    /// Verify the full candle model's logits against the whole-model oracle.
+    VerifyModel {
+        /// oracle_full_f32.safetensors (input_ids, cos/sin, logits, argmax).
+        #[arg(long)]
+        oracle: PathBuf,
+        /// Directory of the 9B's sharded safetensors weights.
+        #[arg(long)]
+        weights: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -61,7 +70,29 @@ fn main() -> Result<()> {
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
         Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
         Cmd::VerifyAttn { oracle } => verify_attn(&oracle),
+        Cmd::VerifyModel { oracle, weights } => verify_model(&oracle, &weights),
     }
+}
+
+fn verify_model(oracle: &PathBuf, weights: &PathBuf) -> Result<()> {
+    let o = safetensors::load(oracle, &Device::Cpu)
+        .with_context(|| format!("loading {}", oracle.display()))?;
+    println!("loading 9B weights from {} …", weights.display());
+    let w = model::load_weights(weights)?;
+    println!("  loaded {} language-model tensors", w.len());
+
+    let logits = model::full_model_forward(&w, &o["input_ids"], &o["cos"], &o["sin"])?;
+    let got = logits.squeeze(0)?; // [s, vocab]
+    compare(&got, &o["logits"], "full model logits", 5e-2)?;
+
+    // Argmax agreement — the meaningful "same predictions" check.
+    let got_am: Vec<u32> = got.argmax(candle_core::D::Minus1)?.to_vec1()?;
+    let exp_am: Vec<i64> = o["argmax"].to_vec1()?;
+    let n = got_am.len();
+    let hits = got_am.iter().zip(&exp_am).filter(|(a, b)| **a as i64 == **b).count();
+    println!("  argmax agreement: {hits}/{n} positions");
+    println!("  {}", if hits == n { "ARGMAX MATCH ✓" } else { "ARGMAX MISMATCH ✗" });
+    Ok(())
 }
 
 fn verify_attn(path: &PathBuf) -> Result<()> {

@@ -3,8 +3,9 @@
 //! transformer machinery — the risk is in wiring, which the layer oracle checks.
 
 use std::collections::HashMap;
+use std::path::Path;
 
-use candle_core::{D, Device, Result, Tensor};
+use candle_core::{D, DType, Device, Result, Tensor, safetensors};
 use candle_nn::ops::softmax;
 
 use crate::mixer::{linear, mixer_forward, sigmoid, silu};
@@ -134,4 +135,52 @@ pub fn decoder_layer_full(
     let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], EPS)?;
     let h = mlp(w, &format!("{prefix}mlp."), &h)?;
     x.add(&h)
+}
+
+const N_LAYERS: usize = 32;
+const HIDDEN: usize = 4096;
+const FULL_ATTN_INTERVAL: usize = 4; // every 4th layer is full attention
+
+/// Load the 9B's language-model + lm_head weights from a directory of sharded
+/// safetensors, cast to f32 (the vision tower is skipped).
+pub fn load_weights(dir: &Path) -> Result<HashMap<String, Tensor>> {
+    let mut w = HashMap::new();
+    for entry in std::fs::read_dir(dir).map_err(candle_core::Error::wrap)? {
+        let path = entry.map_err(candle_core::Error::wrap)?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            continue;
+        }
+        for (k, v) in safetensors::load(&path, &Device::Cpu)? {
+            if k.starts_with("model.language_model.") || k.starts_with("lm_head.") {
+                w.insert(k, v.to_dtype(DType::F32)?);
+            }
+        }
+    }
+    Ok(w)
+}
+
+/// The full model: embed → 32 hybrid layers (3 DeltaNet : 1 attention) → final
+/// norm → lm_head. Returns logits `[B, S, vocab]`.
+pub fn full_model_forward(
+    w: &HashMap<String, Tensor>,
+    input_ids: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+) -> Result<Tensor> {
+    let (b, s) = input_ids.dims2()?;
+    let embed = &w["model.language_model.embed_tokens.weight"]; // [vocab, hidden]
+    let ids = input_ids.flatten_all()?.to_dtype(DType::U32)?;
+    let mut x = embed.index_select(&ids, 0)?.reshape((b, s, HIDDEN))?;
+
+    for i in 0..N_LAYERS {
+        let prefix = format!("model.language_model.layers.{i}.");
+        x = if (i + 1) % FULL_ATTN_INTERVAL == 0 {
+            decoder_layer_full(w, &x, cos, sin, &prefix)?
+        } else {
+            decoder_layer_linear(w, &x, &prefix)?
+        };
+    }
+
+    let x = rmsnorm(&x, &w["model.language_model.norm.weight"], EPS)?;
+    linear(&x, &w["lm_head.weight"]) // [b, s, vocab]
 }
