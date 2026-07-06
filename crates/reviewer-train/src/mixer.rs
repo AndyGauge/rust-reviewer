@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use candle_core::{D, Result, Tensor};
 
+use crate::config::Config;
 use crate::delta::recurrent_gated_delta_rule;
 
 /// Look up `{prefix}{name}` in the weight map.
@@ -61,11 +62,11 @@ fn repeat_interleave2(x: &Tensor, rep: usize) -> Result<Tensor> {
 /// Full DeltaNet mixer forward. `x`: `[B, S, hidden]` → `[B, S, hidden]`.
 /// `prefix` locates the mixer's weights (e.g. `""` standalone, `"linear_attn."`
 /// inside a decoder layer).
-pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str) -> Result<Tensor> {
-    let (nv, nk, dk, dv, kernel, eps) = (32usize, 16usize, 128usize, 128usize, 4usize, 1e-6f64);
-    let key_dim = nk * dk; // 2048
-    let value_dim = nv * dv; // 4096
-    let conv_dim = key_dim * 2 + value_dim; // 8192
+pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg: &Config) -> Result<Tensor> {
+    let (nv, nk, dk, dv, kernel, eps) = (cfg.nv, cfg.nk, cfg.dk, cfg.dv, cfg.conv_kernel, cfg.eps);
+    let key_dim = cfg.key_dim();
+    let value_dim = cfg.value_dim();
+    let conv_dim = cfg.conv_dim();
     let (b, s, _) = x.dims3()?;
 
     let mixed = linear(x, wt(w, prefix, "in_proj_qkv.weight"))?; // [b,s,8192]

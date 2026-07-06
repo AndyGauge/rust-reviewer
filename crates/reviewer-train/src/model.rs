@@ -8,9 +8,8 @@ use std::path::Path;
 use candle_core::{D, DType, Device, Result, Tensor, safetensors};
 use candle_nn::ops::softmax;
 
+use crate::config::Config;
 use crate::mixer::{linear, mixer_forward, sigmoid, silu};
-
-const EPS: f64 = 1e-6;
 
 /// RMSNorm with Qwen3.5's `(1 + weight)` scale (weight is stored zero-centered,
 /// unlike the mixer's gated norm which uses `weight` directly).
@@ -29,12 +28,12 @@ pub(crate) fn mlp(w: &HashMap<String, Tensor>, prefix: &str, x: &Tensor) -> Resu
 
 /// A DeltaNet (linear-attention) decoder layer: pre-norm mixer + pre-norm MLP,
 /// each with a residual. `prefix` locates this layer's weights.
-pub fn decoder_layer_linear(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str) -> Result<Tensor> {
-    let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], EPS)?;
-    let h = mixer_forward(w, &h, &format!("{prefix}linear_attn."))?;
+pub fn decoder_layer_linear(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg: &Config) -> Result<Tensor> {
+    let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
+    let h = mixer_forward(w, &h, &format!("{prefix}linear_attn."), cfg)?;
     let x = x.add(&h)?;
 
-    let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], EPS)?;
+    let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
     let h = mlp(w, &format!("{prefix}mlp."), &h)?;
     x.add(&h)
 }
@@ -87,18 +86,19 @@ fn attention(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
+    cfg: &Config,
 ) -> Result<Tensor> {
-    let (nh, nkv, hd) = (16usize, 4usize, 256usize);
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
     let (b, s, _) = x.dims3()?;
 
     let qg = linear(x, &w[&format!("{prefix}q_proj.weight")])?.reshape((b, s, nh, 2 * hd))?;
     let query = qg.narrow(3, 0, hd)?.contiguous()?; // [b,s,nh,hd]
-    let gate = qg.narrow(3, hd, hd)?.contiguous()?.reshape((b, s, nh * hd))?; // [b,s,4096]
+    let gate = qg.narrow(3, hd, hd)?.contiguous()?.reshape((b, s, nh * hd))?;
 
-    let query = rmsnorm(&query, &w[&format!("{prefix}q_norm.weight")], EPS)?;
+    let query = rmsnorm(&query, &w[&format!("{prefix}q_norm.weight")], cfg.eps)?;
     let query = query.transpose(1, 2)?.contiguous()?; // [b,nh,s,hd]
     let key = linear(x, &w[&format!("{prefix}k_proj.weight")])?.reshape((b, s, nkv, hd))?;
-    let key = rmsnorm(&key, &w[&format!("{prefix}k_norm.weight")], EPS)?;
+    let key = rmsnorm(&key, &w[&format!("{prefix}k_norm.weight")], cfg.eps)?;
     let key = key.transpose(1, 2)?.contiguous()?; // [b,nkv,s,hd]
     let value = linear(x, &w[&format!("{prefix}v_proj.weight")])?
         .reshape((b, s, nkv, hd))?
@@ -128,20 +128,17 @@ pub fn decoder_layer_full(
     cos: &Tensor,
     sin: &Tensor,
     prefix: &str,
+    cfg: &Config,
 ) -> Result<Tensor> {
-    let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], EPS)?;
-    let h = attention(w, &format!("{prefix}self_attn."), &h, cos, sin)?;
+    let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
+    let h = attention(w, &format!("{prefix}self_attn."), &h, cos, sin, cfg)?;
     let x = x.add(&h)?;
-    let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], EPS)?;
+    let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
     let h = mlp(w, &format!("{prefix}mlp."), &h)?;
     x.add(&h)
 }
 
-const N_LAYERS: usize = 32;
-const HIDDEN: usize = 4096;
-const FULL_ATTN_INTERVAL: usize = 4; // every 4th layer is full attention
-
-/// Load the 9B's language-model + lm_head weights from a directory of sharded
+/// Load the language-model + lm_head weights from a directory of sharded
 /// safetensors onto `device`, cast to f32 (the vision tower is skipped).
 pub fn load_weights(dir: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
     let mut w = HashMap::new();
@@ -166,21 +163,22 @@ pub fn full_model_forward(
     input_ids: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
+    cfg: &Config,
 ) -> Result<Tensor> {
     let (b, s) = input_ids.dims2()?;
     let embed = &w["model.language_model.embed_tokens.weight"]; // [vocab, hidden]
     let ids = input_ids.flatten_all()?.to_dtype(DType::U32)?;
-    let mut x = embed.index_select(&ids, 0)?.reshape((b, s, HIDDEN))?;
+    let mut x = embed.index_select(&ids, 0)?.reshape((b, s, cfg.hidden))?;
 
-    for i in 0..N_LAYERS {
+    for i in 0..cfg.n_layers {
         let prefix = format!("model.language_model.layers.{i}.");
-        x = if (i + 1) % FULL_ATTN_INTERVAL == 0 {
-            decoder_layer_full(w, &x, cos, sin, &prefix)?
+        x = if cfg.is_full_attn(i) {
+            decoder_layer_full(w, &x, cos, sin, &prefix, cfg)?
         } else {
-            decoder_layer_linear(w, &x, &prefix)?
+            decoder_layer_linear(w, &x, &prefix, cfg)?
         };
     }
 
-    let x = rmsnorm(&x, &w["model.language_model.norm.weight"], EPS)?;
+    let x = rmsnorm(&x, &w["model.language_model.norm.weight"], cfg.eps)?;
     linear(&x, &w["lm_head.weight"]) // [b, s, vocab]
 }

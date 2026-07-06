@@ -9,11 +9,13 @@
 //! This skeleton just loads and inspects the oracle — the first Rust code to
 //! touch both candle and the ground-truth tensors. The model port builds on it.
 
+mod config;
 mod delta;
 mod mixer;
 mod model;
 
 use anyhow::{Context, Result};
+use config::Config;
 use candle_core::{Device, safetensors};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -54,12 +56,15 @@ enum Cmd {
     },
     /// Verify the full candle model's logits against the whole-model oracle.
     VerifyModel {
-        /// oracle_full_f32.safetensors (input_ids, cos/sin, logits, argmax).
+        /// oracle safetensors (input_ids, cos/sin, logits, argmax).
         #[arg(long)]
         oracle: PathBuf,
-        /// Directory of the 9B's sharded safetensors weights.
+        /// Directory of the model's sharded safetensors weights.
         #[arg(long)]
         weights: PathBuf,
+        /// Model config.json (dims). Defaults to the 9B if omitted.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -70,20 +75,25 @@ fn main() -> Result<()> {
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
         Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
         Cmd::VerifyAttn { oracle } => verify_attn(&oracle),
-        Cmd::VerifyModel { oracle, weights } => verify_model(&oracle, &weights),
+        Cmd::VerifyModel { oracle, weights, config } => verify_model(&oracle, &weights, config.as_deref()),
     }
 }
 
-fn verify_model(oracle: &PathBuf, weights: &PathBuf) -> Result<()> {
+fn verify_model(oracle: &PathBuf, weights: &PathBuf, config: Option<&std::path::Path>) -> Result<()> {
+    let cfg = match config {
+        Some(p) => Config::from_json(p)?,
+        None => Config::qwen9b(),
+    };
+    println!("config: {} layers, hidden {}", cfg.n_layers, cfg.hidden);
     let dev = Device::cuda_if_available(0)?;
     println!("device: {dev:?}");
     let o = safetensors::load(oracle, &dev)
         .with_context(|| format!("loading {}", oracle.display()))?;
-    println!("loading 9B weights from {} …", weights.display());
+    println!("loading weights from {} …", weights.display());
     let w = model::load_weights(weights, &dev)?;
     println!("  loaded {} language-model tensors", w.len());
 
-    let logits = model::full_model_forward(&w, &o["input_ids"], &o["cos"], &o["sin"])?;
+    let logits = model::full_model_forward(&w, &o["input_ids"], &o["cos"], &o["sin"], &cfg)?;
     let got = logits.squeeze(0)?; // [s, vocab]
     compare(&got, &o["logits"], "full model logits", 5e-2)?;
 
@@ -100,7 +110,7 @@ fn verify_model(oracle: &PathBuf, weights: &PathBuf) -> Result<()> {
 fn verify_attn(path: &PathBuf) -> Result<()> {
     let w = safetensors::load(path, &Device::Cpu)
         .with_context(|| format!("loading {}", path.display()))?;
-    let got = model::decoder_layer_full(&w, &w["input"], &w["cos"], &w["sin"], "")?;
+    let got = model::decoder_layer_full(&w, &w["input"], &w["cos"], &w["sin"], "", &Config::qwen9b())?;
     compare(&got, &w["output"], "full-attention decoder layer", 1e-3)
 }
 
@@ -119,14 +129,14 @@ fn compare(got: &candle_core::Tensor, exp: &candle_core::Tensor, what: &str, tol
 fn verify_layer(path: &PathBuf) -> Result<()> {
     let w = safetensors::load(path, &Device::Cpu)
         .with_context(|| format!("loading {}", path.display()))?;
-    let got = model::decoder_layer_linear(&w, &w["input"], "")?;
+    let got = model::decoder_layer_linear(&w, &w["input"], "", &Config::qwen9b())?;
     compare(&got, &w["output"], "DeltaNet decoder layer", 1e-3)
 }
 
 fn verify_mixer(path: &PathBuf) -> Result<()> {
     let w = safetensors::load(path, &Device::Cpu)
         .with_context(|| format!("loading {}", path.display()))?;
-    let got = mixer::mixer_forward(&w, &w["input"], "")?;
+    let got = mixer::mixer_forward(&w, &w["input"], "", &Config::qwen9b())?;
     compare(&got, &w["output"], "full DeltaNet mixer", 1e-3)
 }
 
