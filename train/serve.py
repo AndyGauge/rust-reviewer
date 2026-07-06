@@ -42,7 +42,14 @@ def is_multimodal(model: str) -> bool:
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="Qwen/Qwen3.6-27B")
-    ap.add_argument("--adapter", default=None, help="LoRA adapter dir (omit to serve the base)")
+    ap.add_argument(
+        "--adapter",
+        action="append",
+        default=[],
+        help="LoRA adapter as name=path (repeatable). The request's `model` field "
+        "selects which adapter to activate — base loaded ONCE, no reload to switch. "
+        "A bare path (no name=) is loaded as 'default'.",
+    )
     ap.add_argument("--model-name", default="reviewer", help="name reported to the client")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
@@ -62,11 +69,27 @@ print(f"loading base ({'image-text' if mm else 'causal'}, bf16, ~min) ...")
 MODEL = loader.from_pretrained(
     ARGS.base, dtype=torch.bfloat16, device_map={"": 0}, attn_implementation="sdpa"
 )
-if ARGS.adapter:
+
+# Load every adapter onto the ONE base and switch with set_adapter() per request
+# — this is the actual point of LoRA (frozen base shared, ~1 GB deltas swapped),
+# so comparing epoch-1 vs epoch-3 costs a pointer flip, not a 54 GB reload.
+ADAPTERS = []  # names, in load order; ADAPTERS[0] is the default
+for spec in ARGS.adapter:
+    name, _, path = spec.partition("=")
+    if not path:  # bare path -> "default"
+        name, path = "default", name
     from peft import PeftModel
 
-    print(f"attaching adapter {ARGS.adapter} ...")
-    MODEL = PeftModel.from_pretrained(MODEL, ARGS.adapter)
+    if not ADAPTERS:
+        print(f"attaching adapter {name} <- {path} ...")
+        MODEL = PeftModel.from_pretrained(MODEL, path, adapter_name=name)
+    else:
+        print(f"attaching adapter {name} <- {path} ...")
+        MODEL.load_adapter(path, adapter_name=name)
+    ADAPTERS.append(name)
+if ADAPTERS:
+    MODEL.set_adapter(ADAPTERS[0])
+    print(f"adapters: {ADAPTERS} (default: {ADAPTERS[0]})")
 MODEL.eval()
 if TOK.pad_token_id is None:
     TOK.pad_token = TOK.eos_token
@@ -89,7 +112,8 @@ class ChatReq(BaseModel):
 
 @app.get("/v1/models")
 def models():
-    return {"object": "list", "data": [{"id": ARGS.model_name, "object": "model"}]}
+    ids = ADAPTERS or [ARGS.model_name]
+    return {"object": "list", "data": [{"id": i, "object": "model"} for i in ids]}
 
 
 def build_inputs(messages):
@@ -106,6 +130,13 @@ def build_inputs(messages):
 
 @app.post("/v1/chat/completions")
 def chat(req: ChatReq):
+    # Select the adapter by the request's `model` field (no reload — set_adapter
+    # is a pointer flip). Single-stream only: set_adapter mutates shared state, so
+    # concurrent requests for different adapters would race — fine here, the
+    # harness drives this server sequentially.
+    if ADAPTERS and req.model in ADAPTERS:
+        MODEL.set_adapter(req.model)
+
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     inputs = build_inputs(messages)
     inputs = {k: v.to(MODEL.device) for k, v in inputs.items()}
