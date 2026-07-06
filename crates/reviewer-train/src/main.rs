@@ -47,6 +47,11 @@ enum Cmd {
         #[arg(long)]
         oracle: PathBuf,
     },
+    /// Verify the candle full-attention decoder layer against its oracle.
+    VerifyAttn {
+        #[arg(long)]
+        oracle: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -55,7 +60,15 @@ fn main() -> Result<()> {
         Cmd::VerifyDelta { oracle } => verify_delta(&oracle),
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
         Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
+        Cmd::VerifyAttn { oracle } => verify_attn(&oracle),
     }
+}
+
+fn verify_attn(path: &PathBuf) -> Result<()> {
+    let w = safetensors::load(path, &Device::Cpu)
+        .with_context(|| format!("loading {}", path.display()))?;
+    let got = model::decoder_layer_full(&w, &w["input"], &w["cos"], &w["sin"], "")?;
+    compare(&got, &w["output"], "full-attention decoder layer", 1e-3)
 }
 
 /// Compare a computed tensor against the oracle's expected tensor.
