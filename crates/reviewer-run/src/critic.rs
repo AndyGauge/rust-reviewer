@@ -179,6 +179,11 @@ fn build_body(model: &str, prompt: &str, temperature: f32, max_tokens: u32) -> s
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": false,
+        // Reasoning models (Qwen3.5/3.6) default to a <think> pass that burns the
+        // token budget before answering. The reviewer trained on direct comments,
+        // so disable it — honored by vLLM's chat template; ignored by servers that
+        // handle it themselves (our serve.py) or don't reason.
+        "chat_template_kwargs": { "enable_thinking": false },
     })
 }
 
