@@ -54,20 +54,44 @@ reference** at each step (the oracle method). Reuse `reviewer-core` /
       same prompt: *"I think this is a bugfix, but I'm not sure if it's
       intentional."*, diverging only after the tie above).
 
-### 4c. KV cache (make it not-slow) — the real work
+### 4c. KV cache (make it not-slow) — the real work — DONE (2026-07-06)
 The hybrid arch needs **two** kinds of cached state; this is why the recurrent
 form was built first (the `seq_len == 1` decode branch in the reference).
-- [ ] **Attention layers:** cache per-layer K/V; each new token appends its K/V and
-      attends over the cache. Standard.
-- [ ] **DeltaNet layers:** cache the per-layer recurrent state `S [nk, dk, dv]`.
+- [x] **Attention layers:** cache per-layer K/V; each new token appends its K/V and
+      attends over the cache. Standard. `model::attention_prefill`/`attention_decode`
+      (cache stored pre-`repeat_kv`, at `n_kv_heads`, not `n_heads`).
+- [x] **DeltaNet layers:** cache the per-layer recurrent state `S [nk, dk, dv]`.
       A new token does **one** recurrent step from the cached `S` (decay → read →
       delta → update → read) instead of replaying the sequence. Also cache the
       **conv state** (last `kernel-1` inputs for the causal depthwise conv).
-- [ ] Refactor the forward to a two-mode path: prefill (full sequence, seed the
-      caches) vs decode (seq_len=1, advance the caches).
-- [ ] **Verify:** cached decode must produce the *same* logits as the no-cache
-      path (4b) token for token. This is the highest-risk step — a stale/mis-seeded
-      cache is a silent bug (blog 9 territory), so diff against 4b every time.
+      `delta::recurrent_gated_delta_rule` now takes an `initial_state` and returns
+      the final state — prefill seeds it (zero start), decode is literally one
+      more step of the same loop. `mixer::mixer_decode` does the single-step causal
+      conv as a plain dot product over `[conv_tail, new_col]` (a valid, unpadded
+      one-step convolution) rather than re-deriving candle's padded-conv accounting.
+- [x] Refactor the forward to a two-mode path: prefill (full sequence, seed the
+      caches) vs decode (seq_len=1, advance the caches). `cache::{prefill,decode_step}`
+      orchestrate per-layer `*_prefill`/`*_decode` pairs in `model.rs`/`mixer.rs`;
+      the original no-cache `full_model_forward` and friends are untouched (still
+      back `verify-model`/`verify-mixer`/etc — the cache path is new functions,
+      not a rewrite of already-verified ones).
+- [x] **Verify:** `reviewer-train verify-kv-cache` diffs `generate::greedy_generate_cached`
+      against the Stage 4b no-cache `greedy_generate` on the same fixture — both
+      Rust/candle, so (unlike 4b vs Python) an exact match was the bar. Result:
+      diverges at the *exact same position* as the Stage 4b Python-vs-Rust tie
+      (token 2688 vs 1683) — confirmed by dumping both paths' actual logits at
+      that step: no-cache shows a dead-even tie (18.2500 vs 18.2500, diff 0.0000,
+      an *exact* bf16 tie, even tighter than 4b's), cached lands within one bf16
+      ULP on the other side (18.1250 vs 18.2500). Same known floor, different
+      rounding from a different computation order — not a cache bug. Stronger
+      evidence it's not a stale/mis-seeded cache: the first decode step (right
+      after prefill) matched exactly, so the cache correctly absorbed one full
+      round-trip before any divergence, and only at a hairline tie. Bonus: the
+      cached path's full generation (19 tokens, hit EOS) came out **byte-identical**
+      to Python's oracle from Stage 4b (*"I think this is a bugfix, but I'm not
+      sure if it's intentional."*) — the no-cache Rust path, having landed on the
+      other side of the tie, spirals into a repetition loop instead. `generate`
+      now uses the cache by default (`--no-cache` to opt back into the slow path).
 
 ---
 

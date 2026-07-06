@@ -22,7 +22,13 @@ fn l2norm(x: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// Recurrent gated delta rule.
-/// `q,k`: `[B,S,H,Dk]`  `v`: `[B,S,H,Dv]`  `g,beta`: `[B,S,H]`  →  `[B,S,H,Dv]`.
+/// `q,k`: `[B,S,H,Dk]`  `v`: `[B,S,H,Dv]`  `g,beta`: `[B,S,H]`  →
+/// `([B,S,H,Dv] out, [B,H,Dk,Dv] final_state)`.
+///
+/// `initial_state` seeds the recurrence instead of starting from zero — this
+/// is what makes a KV-cache decode step just "one more step of the same loop":
+/// prefill runs the full sequence from a zero state and keeps the final state;
+/// decode runs a single new timestep (`S == 1`) starting from that kept state.
 pub fn recurrent_gated_delta_rule(
     q: &Tensor,
     k: &Tensor,
@@ -30,7 +36,8 @@ pub fn recurrent_gated_delta_rule(
     g: &Tensor,
     beta: &Tensor,
     qk_l2norm: bool,
-) -> Result<Tensor> {
+    initial_state: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
     let (q, k) = if qk_l2norm {
         (l2norm(q, 1e-6)?, l2norm(k, 1e-6)?)
     } else {
@@ -48,7 +55,10 @@ pub fn recurrent_gated_delta_rule(
     let scale = 1.0 / (dk as f64).sqrt();
     let q = q.affine(scale, 0.0)?;
 
-    let mut state = Tensor::zeros((b, h, dk, dv), q.dtype(), q.device())?; // S[k,v]
+    let mut state = match initial_state {
+        Some(s) => s.clone(),
+        None => Tensor::zeros((b, h, dk, dv), q.dtype(), q.device())?, // S[k,v]
+    };
     let mut outs = Vec::with_capacity(s);
     for i in 0..s {
         let q_t = q.narrow(2, i, 1)?.squeeze(2)?; // [B,H,Dk]
@@ -75,5 +85,5 @@ pub fn recurrent_gated_delta_rule(
         outs.push(out_i.unsqueeze(2)?); // [B,H,1,Dv]
     }
     let out = Tensor::cat(&outs, 2)?; // [B,H,S,Dv]
-    out.transpose(1, 2)?.contiguous() // [B,S,H,Dv]
+    Ok((out.transpose(1, 2)?.contiguous()?, state)) // ([B,S,H,Dv], [B,H,Dk,Dv])
 }

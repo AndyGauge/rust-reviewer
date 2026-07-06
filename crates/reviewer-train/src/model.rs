@@ -38,6 +38,44 @@ pub fn decoder_layer_linear(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &st
     x.add(&h)
 }
 
+/// Same layer as [`decoder_layer_linear`], but also returns the DeltaNet
+/// cache (`state`, `conv_tail`) a decode step needs to continue from here.
+pub fn decoder_layer_linear_prefill(
+    w: &HashMap<String, Tensor>,
+    x: &Tensor,
+    prefix: &str,
+    cfg: &Config,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
+    let (h, state, conv_tail) = crate::mixer::mixer_forward_prefill(w, &h, &format!("{prefix}linear_attn."), cfg)?;
+    let x = x.add(&h)?;
+
+    let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
+    let h = mlp(w, &format!("{prefix}mlp."), &h)?;
+    Ok((x.add(&h)?, state, conv_tail))
+}
+
+/// One-token decode through a DeltaNet decoder layer: `x1` is `[B,1,hidden]`,
+/// advancing the layer's `state`/`conv_tail` cache in place (returned, not
+/// mutated — the caller owns the cache).
+pub fn decoder_layer_linear_decode(
+    w: &HashMap<String, Tensor>,
+    x1: &Tensor,
+    prefix: &str,
+    cfg: &Config,
+    state: &Tensor,
+    conv_tail: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let h = rmsnorm(x1, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
+    let (h, new_state, new_conv_tail) =
+        crate::mixer::mixer_decode(w, &h, &format!("{prefix}linear_attn."), cfg, state, conv_tail)?;
+    let x1 = x1.add(&h)?;
+
+    let h = rmsnorm(&x1, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
+    let h = mlp(w, &format!("{prefix}mlp."), &h)?;
+    Ok((x1.add(&h)?, new_state, new_conv_tail))
+}
+
 /// Causal additive mask `[s,s]`: 0 on/below the diagonal, -inf above.
 fn causal_mask(s: usize, device: &Device) -> Result<Tensor> {
     let mut data = vec![0f32; s * s];
@@ -121,6 +159,105 @@ fn attention(
     linear(&out, &w[&format!("{prefix}o_proj.weight")])
 }
 
+/// Project `x` into (query, key, value, gate) before RoPE — the part
+/// [`attention`], [`attention_prefill`], and [`attention_decode`] all share;
+/// they diverge only in what happens to key/value after (mask over the whole
+/// sequence, vs. cache + no mask).
+fn qkv_gate(
+    w: &HashMap<String, Tensor>,
+    prefix: &str,
+    x: &Tensor,
+    cfg: &Config,
+) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    let (b, s, _) = x.dims3()?;
+
+    let qg = linear(x, &w[&format!("{prefix}q_proj.weight")])?.reshape((b, s, nh, 2 * hd))?;
+    let query = qg.narrow(3, 0, hd)?.contiguous()?;
+    let gate = qg.narrow(3, hd, hd)?.contiguous()?.reshape((b, s, nh * hd))?;
+    let query = rmsnorm(&query, &w[&format!("{prefix}q_norm.weight")], cfg.eps)?
+        .transpose(1, 2)?
+        .contiguous()?; // [b,nh,s,hd]
+
+    let key = linear(x, &w[&format!("{prefix}k_proj.weight")])?.reshape((b, s, nkv, hd))?;
+    let key = rmsnorm(&key, &w[&format!("{prefix}k_norm.weight")], cfg.eps)?
+        .transpose(1, 2)?
+        .contiguous()?; // [b,nkv,s,hd]
+    let value = linear(x, &w[&format!("{prefix}v_proj.weight")])?
+        .reshape((b, s, nkv, hd))?
+        .transpose(1, 2)?
+        .contiguous()?;
+
+    Ok((query, key, value, gate))
+}
+
+/// Same attention as [`attention`], but also returns the K/V cache (post-RoPE
+/// key, pre-`repeat_kv` so the cache stays at `n_kv_heads`, not `n_heads`) a
+/// decode step needs.
+pub fn attention_prefill(
+    w: &HashMap<String, Tensor>,
+    prefix: &str,
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    cfg: &Config,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    let (b, s, _) = x.dims3()?;
+
+    let (query, key, value, gate) = qkv_gate(w, prefix, x, cfg)?;
+    let query = apply_rope(&query, cos, sin)?;
+    let key = apply_rope(&key, cos, sin)?; // this is the cache
+
+    let key_r = repeat_kv(&key, nh / nkv)?;
+    let value_r = repeat_kv(&value, nh / nkv)?;
+
+    let scale = (hd as f64).powf(-0.5);
+    let attn = query.matmul(&key_r.transpose(2, 3)?.contiguous()?)?.affine(scale, 0.0)?;
+    let mask = causal_mask(s, x.device())?.to_dtype(attn.dtype())?;
+    let attn = softmax(&attn.broadcast_add(&mask)?, D::Minus1)?;
+    let out = attn.matmul(&value_r)?.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
+    let out = out.mul(&sigmoid(&gate)?)?;
+    let out = linear(&out, &w[&format!("{prefix}o_proj.weight")])?;
+    Ok((out, key, value))
+}
+
+/// One new token's attention: `x1` is `[B,1,hidden]`. Appends this token's
+/// (post-RoPE) key/value to `k_cache`/`v_cache` and attends over the result —
+/// no causal mask needed, since a single query at the last position is
+/// causally valid against every key already in the cache.
+pub fn attention_decode(
+    w: &HashMap<String, Tensor>,
+    prefix: &str,
+    x1: &Tensor,
+    cos1: &Tensor,
+    sin1: &Tensor,
+    cfg: &Config,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    let b = x1.dim(0)?;
+
+    let (query, key, value, gate) = qkv_gate(w, prefix, x1, cfg)?;
+    let query = apply_rope(&query, cos1, sin1)?;
+    let key = apply_rope(&key, cos1, sin1)?;
+
+    let new_k = Tensor::cat(&[k_cache, &key], 2)?;
+    let new_v = Tensor::cat(&[v_cache, &value], 2)?;
+
+    let key_r = repeat_kv(&new_k, nh / nkv)?;
+    let value_r = repeat_kv(&new_v, nh / nkv)?;
+
+    let scale = (hd as f64).powf(-0.5);
+    let attn = query.matmul(&key_r.transpose(2, 3)?.contiguous()?)?.affine(scale, 0.0)?; // [b,nh,1,total]
+    let attn = softmax(&attn, D::Minus1)?;
+    let out = attn.matmul(&value_r)?.transpose(1, 2)?.contiguous()?.reshape((b, 1, nh * hd))?;
+    let out = out.mul(&sigmoid(&gate)?)?;
+    let out = linear(&out, &w[&format!("{prefix}o_proj.weight")])?;
+    Ok((out, new_k, new_v))
+}
+
 /// A full-attention decoder layer (pre-norm attention + residual, pre-norm MLP +
 /// residual). Needs the RoPE `cos`/`sin` for its position.
 pub fn decoder_layer_full(
@@ -137,6 +274,44 @@ pub fn decoder_layer_full(
     let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
     let h = mlp(w, &format!("{prefix}mlp."), &h)?;
     x.add(&h)
+}
+
+/// Same layer as [`decoder_layer_full`], but also returns the attention K/V
+/// cache a decode step needs.
+pub fn decoder_layer_full_prefill(
+    w: &HashMap<String, Tensor>,
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    prefix: &str,
+    cfg: &Config,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
+    let (h, k, v) = attention_prefill(w, &format!("{prefix}self_attn."), &h, cos, sin, cfg)?;
+    let x = x.add(&h)?;
+    let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
+    let h = mlp(w, &format!("{prefix}mlp."), &h)?;
+    Ok((x.add(&h)?, k, v))
+}
+
+/// One-token decode through a full-attention decoder layer: `x1` is
+/// `[B,1,hidden]`, `cos1`/`sin1` the single-position RoPE table.
+pub fn decoder_layer_full_decode(
+    w: &HashMap<String, Tensor>,
+    x1: &Tensor,
+    cos1: &Tensor,
+    sin1: &Tensor,
+    prefix: &str,
+    cfg: &Config,
+    k_cache: &Tensor,
+    v_cache: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let h = rmsnorm(x1, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
+    let (h, k, v) = attention_decode(w, &format!("{prefix}self_attn."), &h, cos1, sin1, cfg, k_cache, v_cache)?;
+    let x1 = x1.add(&h)?;
+    let h = rmsnorm(&x1, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
+    let h = mlp(w, &format!("{prefix}mlp."), &h)?;
+    Ok((x1.add(&h)?, k, v))
 }
 
 /// Load the language-model + lm_head weights from a directory of sharded

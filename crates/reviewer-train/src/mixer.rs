@@ -61,8 +61,24 @@ fn repeat_interleave2(x: &Tensor, rep: usize) -> Result<Tensor> {
 
 /// Full DeltaNet mixer forward. `x`: `[B, S, hidden]` → `[B, S, hidden]`.
 /// `prefix` locates the mixer's weights (e.g. `""` standalone, `"linear_attn."`
-/// inside a decoder layer).
+/// inside a decoder layer). Thin wrapper over [`mixer_forward_prefill`] that
+/// drops the cache it captures — kept so the existing oracle-verified callers
+/// (`verify-mixer`/`verify-layer`/`verify-model`) don't change shape.
 pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg: &Config) -> Result<Tensor> {
+    mixer_forward_prefill(w, x, prefix, cfg).map(|(out, _state, _conv_tail)| out)
+}
+
+/// Same forward as [`mixer_forward`], but also returns the pieces a decode
+/// step needs to pick up where this left off: the final recurrent state
+/// `S [B,H,Dk,Dv]`, and the causal conv's last `kernel-1` *pre-conv* input
+/// columns (`conv_tail`, `[B,conv_dim,kernel-1]`) — the causal conv's own
+/// "history" a single new token's conv step needs.
+pub fn mixer_forward_prefill(
+    w: &HashMap<String, Tensor>,
+    x: &Tensor,
+    prefix: &str,
+    cfg: &Config,
+) -> Result<(Tensor, Tensor, Tensor)> {
     let (nv, nk, dk, dv, kernel, eps) = (cfg.nv, cfg.nk, cfg.dk, cfg.dv, cfg.conv_kernel, cfg.eps);
     let key_dim = cfg.key_dim();
     let value_dim = cfg.value_dim();
@@ -93,7 +109,7 @@ pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg:
     let query = repeat_interleave2(&query, rep)?; // [b,s,32,128]
     let key = repeat_interleave2(&key, rep)?;
 
-    let core = recurrent_gated_delta_rule(&query, &key, &value, &g, &beta, true)?; // [b,s,32,128]
+    let (core, final_state) = recurrent_gated_delta_rule(&query, &key, &value, &g, &beta, true, None)?; // [b,s,32,128]
 
     // Gated norm over each (·, head_v_dim) row, then out-projection.
     let core2 = core.reshape((b * s * nv, dv))?;
@@ -101,5 +117,63 @@ pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg:
     let normed = gated_rmsnorm(&core2, &z2, wt(w, prefix, "norm.weight"), eps)?;
     let core = normed.reshape((b, s, value_dim))?;
 
-    linear(&core, wt(w, prefix, "out_proj.weight"))
+    let out = linear(&core, wt(w, prefix, "out_proj.weight"))?;
+    let conv_tail = mt.narrow(2, s - (kernel - 1), kernel - 1)?.contiguous()?;
+    Ok((out, final_state, conv_tail))
+}
+
+/// One-token DeltaNet decode: `x1` is `[B,1,hidden]`. `state`/`conv_tail` are
+/// this layer's cache from the previous step (seeded by
+/// [`mixer_forward_prefill`], advanced by this function every call after).
+/// Does one recurrent step from `state` instead of replaying the sequence,
+/// and a single causal-conv step over `[conv_tail, new_col]` — a plain
+/// dot product, since that window is exactly one valid (unpadded) conv step.
+pub fn mixer_decode(
+    w: &HashMap<String, Tensor>,
+    x1: &Tensor,
+    prefix: &str,
+    cfg: &Config,
+    state: &Tensor,
+    conv_tail: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor)> {
+    let (nv, nk, dk, dv, kernel, eps) = (cfg.nv, cfg.nk, cfg.dk, cfg.dv, cfg.conv_kernel, cfg.eps);
+    let key_dim = cfg.key_dim();
+    let value_dim = cfg.value_dim();
+    let b = x1.dim(0)?;
+
+    let mixed = linear(x1, wt(w, prefix, "in_proj_qkv.weight"))?; // [b,1,conv_dim]
+    let z = linear(x1, wt(w, prefix, "in_proj_z.weight"))?;
+    let bb = linear(x1, wt(w, prefix, "in_proj_b.weight"))?;
+    let aa = linear(x1, wt(w, prefix, "in_proj_a.weight"))?;
+
+    // window = [conv_tail (oldest..newest-1), new_col (newest)], chronological
+    // order matching `conv1d.weight`'s own [oldest..newest] tap order.
+    let new_col = mixed.transpose(1, 2)?.contiguous()?; // [b,conv_dim,1]
+    let window = Tensor::cat(&[conv_tail, &new_col], 2)?; // [b,conv_dim,kernel]
+    let weight = wt(w, prefix, "conv1d.weight").squeeze(1)?.unsqueeze(0)?; // [1,conv_dim,kernel]
+    let conv_out = window.broadcast_mul(&weight)?.sum(2)?; // [b,conv_dim]
+    let qkv = silu(&conv_out)?.unsqueeze(1)?; // [b,1,conv_dim]
+
+    let query = qkv.narrow(2, 0, key_dim)?.contiguous()?.reshape((b, 1, nk, dk))?;
+    let key = qkv.narrow(2, key_dim, key_dim)?.contiguous()?.reshape((b, 1, nk, dk))?;
+    let value = qkv.narrow(2, key_dim * 2, value_dim)?.contiguous()?.reshape((b, 1, nv, dv))?;
+
+    let beta = sigmoid(&bb)?;
+    let g = softplus(&aa.broadcast_add(wt(w, prefix, "dt_bias"))?)?;
+    let g = g.broadcast_mul(&wt(w, prefix, "A_log").exp()?.neg()?)?;
+
+    let rep = nv / nk;
+    let query = repeat_interleave2(&query, rep)?;
+    let key = repeat_interleave2(&key, rep)?;
+
+    let (core, new_state) = recurrent_gated_delta_rule(&query, &key, &value, &g, &beta, true, Some(state))?; // [b,1,32,128]
+
+    let core2 = core.reshape((b * nv, dv))?;
+    let z2 = z.reshape((b * nv, dv))?;
+    let normed = gated_rmsnorm(&core2, &z2, wt(w, prefix, "norm.weight"), eps)?;
+    let core = normed.reshape((b, 1, value_dim))?;
+    let out = linear(&core, wt(w, prefix, "out_proj.weight"))?;
+
+    let new_conv_tail = window.narrow(2, 1, kernel - 1)?.contiguous()?; // drop oldest
+    Ok((out, new_state, new_conv_tail))
 }

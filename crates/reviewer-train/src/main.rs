@@ -9,6 +9,7 @@
 //! This skeleton just loads and inspects the oracle — the first Rust code to
 //! touch both candle and the ground-truth tensors. The model port builds on it.
 
+mod cache;
 mod chat;
 mod config;
 mod delta;
@@ -124,6 +125,11 @@ enum Cmd {
         lora_scale: f64,
         #[arg(long, default_value_t = 128)]
         max_new_tokens: usize,
+        /// Use the Stage 4b no-cache loop (O(n^2), for comparison/debugging)
+        /// instead of the Stage 4c KV/state cache (the default — this is the
+        /// whole point of 4c: not re-running the full sequence every token).
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Verify greedy generation (no KV cache) against a Python greedy-decode
     /// oracle (`train/greedy_oracle.py`, `do_sample=False`) on the same
@@ -157,6 +163,29 @@ enum Cmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Stage 4c: verify the KV/recurrent-state cache by diffing
+    /// `generate::greedy_generate_cached` against the Stage 4b no-cache
+    /// `greedy_generate` on the same fixture — both Rust, both candle, so
+    /// unlike `verify-generate` this should match exactly, not "up to a bf16
+    /// tie": any divergence here is the cache, not cross-framework drift.
+    VerifyKvCache {
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        bf16: bool,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
+        #[arg(long, default_value_t = 32)]
+        max_new_tokens: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -173,14 +202,88 @@ fn main() -> Result<()> {
         Cmd::VerifyChatTemplate { fixture, tokenizer, oracle } => {
             verify_chat_template(&fixture, &tokenizer, &oracle)
         }
-        Cmd::Generate { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
-            generate_cmd(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        Cmd::Generate { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens, no_cache } => {
+            generate_cmd(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens, no_cache)
         }
         Cmd::VerifyGenerate { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, oracle } => {
             verify_generate(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, &oracle)
         }
         Cmd::VerifyRope { oracle, config } => verify_rope(&oracle, config.as_deref()),
+        Cmd::VerifyKvCache { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
+            verify_kv_cache(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_kv_cache(
+    fixture: &PathBuf,
+    tokenizer: &PathBuf,
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+    max_new_tokens: usize,
+) -> Result<()> {
+    let fx = chat::ChatFixture::load(fixture)?;
+    let text = chat::render_prompt(&fx.system, &fx.user);
+    let tok = chat::load_tokenizer(tokenizer)?;
+    let prompt_ids = chat::encode(&tok, &text)?;
+    let eos = chat::eos_ids(&tok);
+    println!("prompt: {} tokens, generating up to {max_new_tokens} tokens both ways", prompt_ids.len());
+
+    let (cfg, dev, w) = load_model_for_generation(weights, config, bf16, adapter, lora_scale)?;
+
+    let no_cache = generate::greedy_generate(&w, &cfg, &prompt_ids, max_new_tokens, &eos, &dev)?;
+    let cached = generate::greedy_generate_cached(&w, &cfg, &prompt_ids, max_new_tokens, &eos, &dev)?;
+
+    println!("no-cache ({}): {no_cache:?}", no_cache.len());
+    println!("cached   ({}): {cached:?}", cached.len());
+    let n = no_cache.len().min(cached.len());
+    let hits = no_cache.iter().zip(&cached).take(n).filter(|(a, b)| a == b).count();
+    if let Some((i, (a, b))) = no_cache.iter().zip(&cached).enumerate().find(|(_, (a, b))| a != b) {
+        println!("  first mismatch at index {i}: no-cache={a} cached={b}");
+        // Is this a real disagreement or another instance of the bf16 tie from
+        // Stage 4b? Recompute both paths' actual logits at this exact step —
+        // if they're both near-tied between the two candidates, this is the
+        // same known bf16-precision floor, not a cache bug.
+        diagnose_mismatch(&w, &cfg, &dev, &no_cache[..i], *a, *b)?;
+    }
+    println!("  {hits}/{n} tokens match, lengths: no-cache={} cached={}", no_cache.len(), cached.len());
+    println!("  {}", if hits == n && no_cache.len() == cached.len() { "MATCH ✓" } else { "MISMATCH ✗" });
+    Ok(())
+}
+
+/// Recompute the disputed step's logits both ways — no-cache full recompute
+/// on `prefix` (the agreed-upon context) vs. a fresh prefill-then-one-decode
+/// through the cache — and print where candidates `a`/`b` land in each.
+fn diagnose_mismatch(
+    w: &std::collections::HashMap<String, candle_core::Tensor>,
+    cfg: &Config,
+    dev: &Device,
+    prefix: &[u32],
+    a: u32,
+    b: u32,
+) -> Result<()> {
+    let full = candle_core::Tensor::from_vec(prefix.to_vec(), (1, prefix.len()), dev)?;
+    let (cos, sin) = rope::rope_cos_sin(cfg, prefix.len(), dev)?;
+    let logits_nc = model::full_model_forward(w, &full, &cos, &sin, cfg)?;
+    let last_nc = logits_nc.narrow(1, prefix.len() - 1, 1)?.squeeze(1)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+
+    let prefill_input =
+        candle_core::Tensor::from_vec(prefix[..prefix.len() - 1].to_vec(), (1, prefix.len() - 1), dev)?;
+    let (_prefill_logits, mut c) = cache::prefill(w, &prefill_input, cfg, dev)?;
+    let logits_c = cache::decode_step(w, prefix[prefix.len() - 1], &mut c, cfg, dev)?;
+    let last_c = logits_c.squeeze(1)?.squeeze(0)?.to_dtype(candle_core::DType::F32)?;
+
+    let nc_vals: Vec<f32> = last_nc.to_vec1()?;
+    let c_vals: Vec<f32> = last_c.to_vec1()?;
+    let (va, vb) = (nc_vals[a as usize], nc_vals[b as usize]);
+    let (va2, vb2) = (c_vals[a as usize], c_vals[b as usize]);
+    println!("  no-cache logits: {a}={va:.4} {b}={vb:.4} (diff {:.4})", (va - vb).abs());
+    println!("  cached   logits: {a}={va2:.4} {b}={vb2:.4} (diff {:.4})", (va2 - vb2).abs());
+    Ok(())
 }
 
 fn verify_rope(oracle: &PathBuf, config: Option<&std::path::Path>) -> Result<()> {
@@ -242,6 +345,7 @@ fn generate_cmd(
     adapter: Option<&std::path::Path>,
     lora_scale: f64,
     max_new_tokens: usize,
+    no_cache: bool,
 ) -> Result<()> {
     let fx = chat::ChatFixture::load(fixture)?;
     let text = chat::render_prompt(&fx.system, &fx.user);
@@ -251,7 +355,11 @@ fn generate_cmd(
     println!("prompt: {} tokens", prompt_ids.len());
 
     let (cfg, dev, w) = load_model_for_generation(weights, config, bf16, adapter, lora_scale)?;
-    let ids = generate::greedy_generate(&w, &cfg, &prompt_ids, max_new_tokens, &eos, &dev)?;
+    let ids = if no_cache {
+        generate::greedy_generate(&w, &cfg, &prompt_ids, max_new_tokens, &eos, &dev)?
+    } else {
+        generate::greedy_generate_cached(&w, &cfg, &prompt_ids, max_new_tokens, &eos, &dev)?
+    };
     let new_ids = &ids[prompt_ids.len()..];
     println!("generated {} new tokens: {new_ids:?}", new_ids.len());
     println!("comment:\n{}", chat::decode(&tok, new_ids)?);
@@ -406,8 +514,8 @@ fn verify_mixer(path: &PathBuf) -> Result<()> {
 fn verify_delta(path: &PathBuf) -> Result<()> {
     let t = safetensors::load(path, &Device::Cpu)
         .with_context(|| format!("loading {}", path.display()))?;
-    let got = delta::recurrent_gated_delta_rule(
-        &t["q"], &t["k"], &t["v"], &t["g"], &t["beta"], true,
+    let (got, _final_state) = delta::recurrent_gated_delta_rule(
+        &t["q"], &t["k"], &t["v"], &t["g"], &t["beta"], true, None,
     )?;
     let exp = &t["out"];
     let diff = got.sub(exp)?.abs()?;
