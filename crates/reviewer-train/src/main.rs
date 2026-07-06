@@ -11,6 +11,7 @@
 
 mod delta;
 mod mixer;
+mod model;
 
 use anyhow::{Context, Result};
 use candle_core::{Device, safetensors};
@@ -41,6 +42,11 @@ enum Cmd {
         #[arg(long)]
         oracle: PathBuf,
     },
+    /// Verify the candle DeltaNet decoder layer against the layer oracle.
+    VerifyLayer {
+        #[arg(long)]
+        oracle: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -48,22 +54,34 @@ fn main() -> Result<()> {
         Cmd::Inspect { oracle } => inspect(&oracle),
         Cmd::VerifyDelta { oracle } => verify_delta(&oracle),
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
+        Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
     }
+}
+
+/// Compare a computed tensor against the oracle's expected tensor.
+fn compare(got: &candle_core::Tensor, exp: &candle_core::Tensor, what: &str, tol: f32) -> Result<()> {
+    let diff = got.sub(exp)?.abs()?;
+    let max = diff.max_all()?.to_scalar::<f32>()?;
+    let mean = diff.mean_all()?.to_scalar::<f32>()?;
+    println!("{what} vs reference:");
+    println!("  max_abs_diff  = {max:.3e}");
+    println!("  mean_abs_diff = {mean:.3e}");
+    println!("  {}", if max < tol { "MATCH ✓" } else { "MISMATCH ✗" });
+    Ok(())
+}
+
+fn verify_layer(path: &PathBuf) -> Result<()> {
+    let w = safetensors::load(path, &Device::Cpu)
+        .with_context(|| format!("loading {}", path.display()))?;
+    let got = model::decoder_layer_linear(&w, &w["input"], "")?;
+    compare(&got, &w["output"], "DeltaNet decoder layer", 1e-3)
 }
 
 fn verify_mixer(path: &PathBuf) -> Result<()> {
     let w = safetensors::load(path, &Device::Cpu)
         .with_context(|| format!("loading {}", path.display()))?;
-    let got = mixer::mixer_forward(&w, &w["input"])?;
-    let exp = &w["output"];
-    let diff = got.sub(exp)?.abs()?;
-    let max = diff.max_all()?.to_scalar::<f32>()?;
-    let mean = diff.mean_all()?.to_scalar::<f32>()?;
-    println!("full DeltaNet mixer vs reference:");
-    println!("  max_abs_diff  = {max:.3e}");
-    println!("  mean_abs_diff = {mean:.3e}");
-    println!("  {}", if max < 1e-3 { "MATCH ✓" } else { "MISMATCH ✗" });
-    Ok(())
+    let got = mixer::mixer_forward(&w, &w["input"], "")?;
+    compare(&got, &w["output"], "full DeltaNet mixer", 1e-3)
 }
 
 fn verify_delta(path: &PathBuf) -> Result<()> {

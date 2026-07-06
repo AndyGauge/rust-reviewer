@@ -11,8 +11,13 @@ use candle_core::{D, Result, Tensor};
 
 use crate::delta::recurrent_gated_delta_rule;
 
+/// Look up `{prefix}{name}` in the weight map.
+fn wt<'a>(w: &'a HashMap<String, Tensor>, prefix: &str, name: &str) -> &'a Tensor {
+    &w[&format!("{prefix}{name}")]
+}
+
 /// `x @ w.T` for a no-bias Linear (`w` is `[out, in]`).
-fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
+pub(crate) fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     let dims = x.dims().to_vec();
     let inl = *dims.last().unwrap();
     let out = w.dim(0)?;
@@ -23,11 +28,11 @@ fn linear(x: &Tensor, w: &Tensor) -> Result<Tensor> {
     y.reshape(nd)
 }
 
-fn sigmoid(x: &Tensor) -> Result<Tensor> {
+pub(crate) fn sigmoid(x: &Tensor) -> Result<Tensor> {
     x.neg()?.exp()?.affine(1.0, 1.0)?.recip()
 }
 
-fn silu(x: &Tensor) -> Result<Tensor> {
+pub(crate) fn silu(x: &Tensor) -> Result<Tensor> {
     x.mul(&sigmoid(x)?)
 }
 
@@ -54,21 +59,23 @@ fn repeat_interleave2(x: &Tensor, rep: usize) -> Result<Tensor> {
 }
 
 /// Full DeltaNet mixer forward. `x`: `[B, S, hidden]` → `[B, S, hidden]`.
-pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor) -> Result<Tensor> {
+/// `prefix` locates the mixer's weights (e.g. `""` standalone, `"linear_attn."`
+/// inside a decoder layer).
+pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str) -> Result<Tensor> {
     let (nv, nk, dk, dv, kernel, eps) = (32usize, 16usize, 128usize, 128usize, 4usize, 1e-6f64);
     let key_dim = nk * dk; // 2048
     let value_dim = nv * dv; // 4096
     let conv_dim = key_dim * 2 + value_dim; // 8192
     let (b, s, _) = x.dims3()?;
 
-    let mixed = linear(x, &w["in_proj_qkv.weight"])?; // [b,s,8192]
-    let z = linear(x, &w["in_proj_z.weight"])?; // [b,s,4096]
-    let bb = linear(x, &w["in_proj_b.weight"])?; // [b,s,32]
-    let aa = linear(x, &w["in_proj_a.weight"])?; // [b,s,32]
+    let mixed = linear(x, wt(w, prefix, "in_proj_qkv.weight"))?; // [b,s,8192]
+    let z = linear(x, wt(w, prefix, "in_proj_z.weight"))?; // [b,s,4096]
+    let bb = linear(x, wt(w, prefix, "in_proj_b.weight"))?; // [b,s,32]
+    let aa = linear(x, wt(w, prefix, "in_proj_a.weight"))?; // [b,s,32]
 
     // Causal depthwise conv over the qkv channels, then silu.
     let mt = mixed.transpose(1, 2)?.contiguous()?; // [b,8192,s]
-    let conv = mt.conv1d(&w["conv1d.weight"], kernel - 1, 1, 1, conv_dim)?;
+    let conv = mt.conv1d(wt(w, prefix, "conv1d.weight"), kernel - 1, 1, 1, conv_dim)?;
     let conv = silu(&conv.narrow(2, 0, s)?)?; // causal slice [b,8192,s]
     let qkv = conv.transpose(1, 2)?.contiguous()?; // [b,s,8192]
 
@@ -78,8 +85,8 @@ pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor) -> Result<Tensor> 
 
     let beta = sigmoid(&bb)?; // [b,s,32]
     // g = -exp(A_log) * softplus(a + dt_bias)
-    let g = softplus(&aa.broadcast_add(&w["dt_bias"])?)?;
-    let g = g.broadcast_mul(&w["A_log"].exp()?.neg()?)?; // [b,s,32]
+    let g = softplus(&aa.broadcast_add(wt(w, prefix, "dt_bias"))?)?;
+    let g = g.broadcast_mul(&wt(w, prefix, "A_log").exp()?.neg()?)?; // [b,s,32]
 
     let rep = nv / nk;
     let query = repeat_interleave2(&query, rep)?; // [b,s,32,128]
@@ -90,8 +97,8 @@ pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor) -> Result<Tensor> 
     // Gated norm over each (·, head_v_dim) row, then out-projection.
     let core2 = core.reshape((b * s * nv, dv))?;
     let z2 = z.reshape((b * s * nv, dv))?;
-    let normed = gated_rmsnorm(&core2, &z2, &w["norm.weight"], eps)?;
+    let normed = gated_rmsnorm(&core2, &z2, wt(w, prefix, "norm.weight"), eps)?;
     let core = normed.reshape((b, s, value_dim))?;
 
-    linear(&core, &w["out_proj.weight"])
+    linear(&core, wt(w, prefix, "out_proj.weight"))
 }
