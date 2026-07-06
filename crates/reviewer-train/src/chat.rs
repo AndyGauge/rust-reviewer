@@ -57,6 +57,15 @@ pub fn eos_ids(tok: &Tokenizer) -> Vec<u32> {
         .collect()
 }
 
+/// The tokenizer's pad token id (`tokenizer_config.json`'s `pad_token`,
+/// `<|endoftext|>`) — used to left-pad a batch of ragged prompts to a common
+/// length. Its exact value never matters for correctness (batched prefill
+/// zeroes/masks every padded position before it can influence anything), it
+/// just has to be a valid vocab id for the embedding lookup.
+pub fn pad_id(tok: &Tokenizer) -> u32 {
+    tok.token_to_id("<|endoftext|>").unwrap_or(0)
+}
+
 /// The fixture fed to both sides of the byte-match check: the exact
 /// `reviewer-core` system prompt + one concrete diff hunk through
 /// `reviewer_core::user_prompt`, serialized so a Python oracle script can
@@ -96,5 +105,18 @@ impl ChatFixture {
     pub fn save(&self, path: &Path) -> Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(self)?)
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Load every `{"system":...,"user":...,...}` line from a
+    /// `reviewer-run review --dump-prompts` jsonl file — one hunk per line,
+    /// already in the exact wire shape the harness feeds the model, so this
+    /// is byte-identical to real review input, not a synthetic stand-in.
+    /// Extra fields (`path`, `hunk_header`) are ignored.
+    pub fn load_jsonl(path: &Path) -> Result<Vec<Self>> {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).with_context(|| format!("parsing a line of {}", path.display())))
+            .collect()
     }
 }

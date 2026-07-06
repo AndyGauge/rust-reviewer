@@ -45,9 +45,11 @@ pub fn decoder_layer_linear_prefill(
     x: &Tensor,
     prefix: &str,
     cfg: &Config,
+    pad_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
-    let (h, state, conv_tail) = crate::mixer::mixer_forward_prefill(w, &h, &format!("{prefix}linear_attn."), cfg)?;
+    let (h, state, conv_tail) =
+        crate::mixer::mixer_forward_prefill(w, &h, &format!("{prefix}linear_attn."), cfg, pad_mask)?;
     let x = x.add(&h)?;
 
     let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
@@ -194,6 +196,12 @@ fn qkv_gate(
 /// Same attention as [`attention`], but also returns the K/V cache (post-RoPE
 /// key, pre-`repeat_kv` so the cache stays at `n_kv_heads`, not `n_heads`) a
 /// decode step needs.
+///
+/// `extra_mask`, if given, is an additive `[b,1,1,s]`/`[b,1,s,s]`-broadcastable
+/// mask (0.0 real, `-inf` padding) added on top of the causal mask — for a
+/// left-padded batch, where every row also needs its padded key columns
+/// hidden regardless of causality. `None` (single-sequence, no padding) is
+/// byte-identical to the pre-batching behavior.
 pub fn attention_prefill(
     w: &HashMap<String, Tensor>,
     prefix: &str,
@@ -201,6 +209,7 @@ pub fn attention_prefill(
     cos: &Tensor,
     sin: &Tensor,
     cfg: &Config,
+    extra_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
     let (b, s, _) = x.dims3()?;
@@ -215,7 +224,12 @@ pub fn attention_prefill(
     let scale = (hd as f64).powf(-0.5);
     let attn = query.matmul(&key_r.transpose(2, 3)?.contiguous()?)?.affine(scale, 0.0)?;
     let mask = causal_mask(s, x.device())?.to_dtype(attn.dtype())?;
-    let attn = softmax(&attn.broadcast_add(&mask)?, D::Minus1)?;
+    let attn = attn.broadcast_add(&mask)?;
+    let attn = match extra_mask {
+        Some(m) => attn.broadcast_add(&m.to_dtype(attn.dtype())?)?,
+        None => attn,
+    };
+    let attn = softmax(&attn, D::Minus1)?;
     let out = attn.matmul(&value_r)?.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
     let out = out.mul(&sigmoid(&gate)?)?;
     let out = linear(&out, &w[&format!("{prefix}o_proj.weight")])?;
@@ -224,8 +238,11 @@ pub fn attention_prefill(
 
 /// One new token's attention: `x1` is `[B,1,hidden]`. Appends this token's
 /// (post-RoPE) key/value to `k_cache`/`v_cache` and attends over the result —
-/// no causal mask needed, since a single query at the last position is
-/// causally valid against every key already in the cache.
+/// no *causal* mask needed, since a single query at the last position is
+/// causally valid against every key already in the cache. `extra_mask`
+/// (`[b,1,1,total]`, 0.0/-inf) is still needed if the cache carries a frozen
+/// left-padded prefix from prefill — those columns must stay hidden for the
+/// life of generation, not just during prefill.
 pub fn attention_decode(
     w: &HashMap<String, Tensor>,
     prefix: &str,
@@ -235,6 +252,7 @@ pub fn attention_decode(
     cfg: &Config,
     k_cache: &Tensor,
     v_cache: &Tensor,
+    extra_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
     let b = x1.dim(0)?;
@@ -251,6 +269,10 @@ pub fn attention_decode(
 
     let scale = (hd as f64).powf(-0.5);
     let attn = query.matmul(&key_r.transpose(2, 3)?.contiguous()?)?.affine(scale, 0.0)?; // [b,nh,1,total]
+    let attn = match extra_mask {
+        Some(m) => attn.broadcast_add(&m.to_dtype(attn.dtype())?)?,
+        None => attn,
+    };
     let attn = softmax(&attn, D::Minus1)?;
     let out = attn.matmul(&value_r)?.transpose(1, 2)?.contiguous()?.reshape((b, 1, nh * hd))?;
     let out = out.mul(&sigmoid(&gate)?)?;
@@ -285,9 +307,10 @@ pub fn decoder_layer_full_prefill(
     sin: &Tensor,
     prefix: &str,
     cfg: &Config,
+    extra_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let h = rmsnorm(x, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
-    let (h, k, v) = attention_prefill(w, &format!("{prefix}self_attn."), &h, cos, sin, cfg)?;
+    let (h, k, v) = attention_prefill(w, &format!("{prefix}self_attn."), &h, cos, sin, cfg, extra_mask)?;
     let x = x.add(&h)?;
     let h = rmsnorm(&x, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
     let h = mlp(w, &format!("{prefix}mlp."), &h)?;
@@ -305,9 +328,11 @@ pub fn decoder_layer_full_decode(
     cfg: &Config,
     k_cache: &Tensor,
     v_cache: &Tensor,
+    extra_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let h = rmsnorm(x1, &w[&format!("{prefix}input_layernorm.weight")], cfg.eps)?;
-    let (h, k, v) = attention_decode(w, &format!("{prefix}self_attn."), &h, cos1, sin1, cfg, k_cache, v_cache)?;
+    let (h, k, v) =
+        attention_decode(w, &format!("{prefix}self_attn."), &h, cos1, sin1, cfg, k_cache, v_cache, extra_mask)?;
     let x1 = x1.add(&h)?;
     let h = rmsnorm(&x1, &w[&format!("{prefix}post_attention_layernorm.weight")], cfg.eps)?;
     let h = mlp(w, &format!("{prefix}mlp."), &h)?;

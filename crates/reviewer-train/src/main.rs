@@ -9,6 +9,7 @@
 //! This skeleton just loads and inspects the oracle — the first Rust code to
 //! touch both candle and the ground-truth tensors. The model port builds on it.
 
+mod batch;
 mod cache;
 mod chat;
 mod config;
@@ -186,6 +187,55 @@ enum Cmd {
         #[arg(long, default_value_t = 32)]
         max_new_tokens: usize,
     },
+    /// Stage 5a/5b: verify the batched (left-padded) path by diffing each
+    /// row's output against that same prompt run alone through the Stage 4c
+    /// single-sequence cache — the trusted baseline, since there's no Python
+    /// batched-candle oracle to compare against.
+    VerifyBatch {
+        /// `reviewer-run review --dump-prompts` jsonl (one hunk per line).
+        #[arg(long)]
+        jsonl: PathBuf,
+        /// Use only the first N prompts (omit for all of them).
+        #[arg(long)]
+        n: Option<usize>,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        bf16: bool,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
+        #[arg(long, default_value_t = 32)]
+        max_new_tokens: usize,
+    },
+    /// Stage 5b/5c: sequential (batch=1 x N) vs parallel (one batch=N)
+    /// wall-clock comparison on the same prompts — tokens/sec and hunks/sec,
+    /// the actual measurement behind blog 6's bandwidth-bound decode claim.
+    Bench {
+        #[arg(long)]
+        jsonl: PathBuf,
+        #[arg(long)]
+        n: Option<usize>,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        bf16: bool,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
+        #[arg(long, default_value_t = 128)]
+        max_new_tokens: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -212,7 +262,137 @@ fn main() -> Result<()> {
         Cmd::VerifyKvCache { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
             verify_kv_cache(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
         }
+        Cmd::VerifyBatch { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
+            verify_batch(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        }
+        Cmd::Bench { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
+            bench(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        }
     }
+}
+
+fn load_fixtures(jsonl: &PathBuf, n: Option<usize>) -> Result<Vec<chat::ChatFixture>> {
+    let mut fx = chat::ChatFixture::load_jsonl(jsonl)?;
+    if let Some(n) = n {
+        fx.truncate(n);
+    }
+    Ok(fx)
+}
+
+fn prompt_ids_for(fixtures: &[chat::ChatFixture], tok: &tokenizers::Tokenizer) -> Result<Vec<Vec<u32>>> {
+    fixtures.iter().map(|f| chat::encode(tok, &chat::render_prompt(&f.system, &f.user))).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_batch(
+    jsonl: &PathBuf,
+    n: Option<usize>,
+    tokenizer: &PathBuf,
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+    max_new_tokens: usize,
+) -> Result<()> {
+    let fixtures = load_fixtures(jsonl, n)?;
+    anyhow::ensure!(fixtures.len() >= 2, "need at least 2 prompts to exercise batching (got {})", fixtures.len());
+    let tok = chat::load_tokenizer(tokenizer)?;
+    let prompts = prompt_ids_for(&fixtures, &tok)?;
+    let eos = chat::eos_ids(&tok);
+    let pad_id = chat::pad_id(&tok);
+    let lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+    println!("{} prompts, lengths {lens:?}", prompts.len());
+
+    let (cfg, dev, w) = load_model_for_generation(weights, config, bf16, adapter, lora_scale)?;
+
+    println!("running batched (left-padded, one forward per step)...");
+    let batched = batch::greedy_generate_batch(&w, &cfg, &prompts, pad_id, max_new_tokens, &eos, &dev)?;
+
+    println!("running the Stage 4c single-sequence baseline, one prompt at a time...");
+    let mut all_match = true;
+    for (i, p) in prompts.iter().enumerate() {
+        let single = generate::greedy_generate_cached(&w, &cfg, p, max_new_tokens, &eos, &dev)?;
+        let single_new = &single[p.len()..];
+        let matches = single_new == batched[i].as_slice();
+        println!(
+            "row {i} (prompt {} tokens): batched {} tokens, single {} tokens — {}",
+            p.len(),
+            batched[i].len(),
+            single_new.len(),
+            if matches { "MATCH ✓" } else { "MISMATCH ✗" }
+        );
+        if !matches {
+            all_match = false;
+            let n = batched[i].len().min(single_new.len());
+            if let Some(j) = (0..n).find(|&j| batched[i][j] != single_new[j]) {
+                println!("    first mismatch at generated index {j}: batched={} single={}", batched[i][j], single_new[j]);
+            }
+        }
+    }
+    println!("{}", if all_match { "ALL ROWS MATCH ✓" } else { "SOME ROWS MISMATCH ✗" });
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bench(
+    jsonl: &PathBuf,
+    n: Option<usize>,
+    tokenizer: &PathBuf,
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+    max_new_tokens: usize,
+) -> Result<()> {
+    let fixtures = load_fixtures(jsonl, n)?;
+    let tok = chat::load_tokenizer(tokenizer)?;
+    let prompts = prompt_ids_for(&fixtures, &tok)?;
+    let eos = chat::eos_ids(&tok);
+    let pad_id = chat::pad_id(&tok);
+    let lens: Vec<usize> = prompts.iter().map(|p| p.len()).collect();
+    println!("{} prompts, lengths {lens:?}", prompts.len());
+
+    let (cfg, dev, w) = load_model_for_generation(weights, config, bf16, adapter, lora_scale)?;
+
+    println!("--- sequential (batch=1 x {}) ---", prompts.len());
+    let t0 = std::time::Instant::now();
+    let mut seq_outputs = Vec::new();
+    for p in &prompts {
+        let full = generate::greedy_generate_cached(&w, &cfg, p, max_new_tokens, &eos, &dev)?;
+        seq_outputs.push(full[p.len()..].to_vec());
+    }
+    let seq_elapsed = t0.elapsed();
+    let seq_tokens: usize = seq_outputs.iter().map(|o| o.len()).sum();
+
+    println!("--- parallel (batch = {}) ---", prompts.len());
+    let t1 = std::time::Instant::now();
+    let par_outputs = batch::greedy_generate_batch(&w, &cfg, &prompts, pad_id, max_new_tokens, &eos, &dev)?;
+    let par_elapsed = t1.elapsed();
+    let par_tokens: usize = par_outputs.iter().map(|o| o.len()).sum();
+
+    let n_hunks = prompts.len() as f64;
+    println!();
+    println!(
+        "sequential: {:.1}s, {seq_tokens} tokens, {:.2} tok/s, {:.2} hunks/s",
+        seq_elapsed.as_secs_f64(),
+        seq_tokens as f64 / seq_elapsed.as_secs_f64(),
+        n_hunks / seq_elapsed.as_secs_f64()
+    );
+    println!(
+        "parallel:   {:.1}s, {par_tokens} tokens, {:.2} tok/s, {:.2} hunks/s",
+        par_elapsed.as_secs_f64(),
+        par_tokens as f64 / par_elapsed.as_secs_f64(),
+        n_hunks / par_elapsed.as_secs_f64()
+    );
+    println!("speedup: {:.2}x (wall clock)", seq_elapsed.as_secs_f64() / par_elapsed.as_secs_f64());
+
+    for (i, (s, p)) in seq_outputs.iter().zip(&par_outputs).enumerate() {
+        println!("row {i} sequential: {}", chat::decode(&tok, s)?);
+        println!("row {i} parallel:   {}", chat::decode(&tok, p)?);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

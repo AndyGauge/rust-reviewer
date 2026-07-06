@@ -46,11 +46,11 @@ pub fn prefill(w: &HashMap<String, Tensor>, input_ids: &Tensor, cfg: &Config, de
     for i in 0..cfg.n_layers {
         let prefix = format!("model.language_model.layers.{i}.");
         if cfg.is_full_attn(i) {
-            let (nx, k, v) = decoder_layer_full_prefill(w, &x, &cos, &sin, &prefix, cfg)?;
+            let (nx, k, v) = decoder_layer_full_prefill(w, &x, &cos, &sin, &prefix, cfg, None)?;
             x = nx;
             layers.push(LayerCache::Attn { k, v });
         } else {
-            let (nx, state, conv_tail) = decoder_layer_linear_prefill(w, &x, &prefix, cfg)?;
+            let (nx, state, conv_tail) = decoder_layer_linear_prefill(w, &x, &prefix, cfg, None)?;
             x = nx;
             layers.push(LayerCache::Delta { state, conv_tail });
         }
@@ -76,7 +76,7 @@ pub fn decode_step(w: &HashMap<String, Tensor>, next_id: u32, cache: &mut Cache,
         let prefix = format!("model.language_model.layers.{i}.");
         cache.layers[i] = match &cache.layers[i] {
             LayerCache::Attn { k, v } => {
-                let (nx, nk, nv) = decoder_layer_full_decode(w, &x, &cos1, &sin1, &prefix, cfg, k, v)?;
+                let (nx, nk, nv) = decoder_layer_full_decode(w, &x, &cos1, &sin1, &prefix, cfg, k, v, None)?;
                 x = nx;
                 LayerCache::Attn { k: nk, v: nv }
             }

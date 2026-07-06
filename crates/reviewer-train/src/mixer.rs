@@ -65,7 +65,7 @@ fn repeat_interleave2(x: &Tensor, rep: usize) -> Result<Tensor> {
 /// drops the cache it captures — kept so the existing oracle-verified callers
 /// (`verify-mixer`/`verify-layer`/`verify-model`) don't change shape.
 pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg: &Config) -> Result<Tensor> {
-    mixer_forward_prefill(w, x, prefix, cfg).map(|(out, _state, _conv_tail)| out)
+    mixer_forward_prefill(w, x, prefix, cfg, None).map(|(out, _state, _conv_tail)| out)
 }
 
 /// Same forward as [`mixer_forward`], but also returns the pieces a decode
@@ -73,17 +73,37 @@ pub fn mixer_forward(w: &HashMap<String, Tensor>, x: &Tensor, prefix: &str, cfg:
 /// `S [B,H,Dk,Dv]`, and the causal conv's last `kernel-1` *pre-conv* input
 /// columns (`conv_tail`, `[B,conv_dim,kernel-1]`) — the causal conv's own
 /// "history" a single new token's conv step needs.
+///
+/// `pad_mask` (`[B,S]`, 1.0 real / 0.0 padding) zeroes padded rows *before*
+/// any projection — matching the reference's `apply_mask_to_padding_states`.
+/// A zeroed row produces an exactly-zero `mixed`/`z`/`b`/`a` (the in-projections
+/// are bias-free), so a left-padded prefix's causal conv sees an all-zero
+/// window (output exactly zero) and the recurrence decays/updates a state
+/// that started at zero by exactly zero — no separate padding-aware logic
+/// needed inside the conv or the recurrence loop itself. `None` (the only
+/// case before batching) skips the multiply entirely, byte-identical to the
+/// pre-batching behavior.
 pub fn mixer_forward_prefill(
     w: &HashMap<String, Tensor>,
     x: &Tensor,
     prefix: &str,
     cfg: &Config,
+    pad_mask: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
     let (nv, nk, dk, dv, kernel, eps) = (cfg.nv, cfg.nk, cfg.dk, cfg.dv, cfg.conv_kernel, cfg.eps);
     let key_dim = cfg.key_dim();
     let value_dim = cfg.value_dim();
     let conv_dim = cfg.conv_dim();
     let (b, s, _) = x.dims3()?;
+
+    let masked;
+    let x = match pad_mask {
+        Some(m) => {
+            masked = x.broadcast_mul(&m.unsqueeze(2)?.to_dtype(x.dtype())?)?;
+            &masked
+        }
+        None => x,
+    };
 
     let mixed = linear(x, wt(w, prefix, "in_proj_qkv.weight"))?; // [b,s,8192]
     let z = linear(x, wt(w, prefix, "in_proj_z.weight"))?; // [b,s,4096]

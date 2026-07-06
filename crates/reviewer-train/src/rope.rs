@@ -60,3 +60,49 @@ pub fn rope_cos_sin_at(cfg: &Config, pos: usize, device: &Device) -> Result<(Ten
     let sin = Tensor::from_vec(sin, (1, 1, dim), device)?;
     Ok((cos, sin))
 }
+
+/// Batched prefill positions: one independent position sequence per row,
+/// shape `[b, max_len, rotary_dim]`. Left-padded batches need this instead of
+/// [`rope_cos_sin`] because position is *row-relative to that row's own real
+/// content*, not the shared column index — the reference computes it as
+/// `cumsum(attention_mask) - 1` per row (0,1,2,... starting at that row's
+/// first real token, whatever column it lands on); padded columns get an
+/// arbitrary placeholder here since the attention/DeltaNet padding masks zero
+/// their contribution regardless of what RoPE did to them.
+pub fn rope_cos_sin_rows(cfg: &Config, positions: &[Vec<usize>], device: &Device) -> Result<(Tensor, Tensor)> {
+    let dim = cfg.rotary_dim();
+    let freq = inv_freq(cfg);
+    let b = positions.len();
+    let max_len = positions.first().map_or(0, |row| row.len());
+    let mut cos = Vec::with_capacity(b * max_len * dim);
+    let mut sin = Vec::with_capacity(b * max_len * dim);
+    for row in positions {
+        for &p in row {
+            let (c, s) = cos_sin_row(dim, &freq, p);
+            cos.extend(c);
+            sin.extend(s);
+        }
+    }
+    let cos = Tensor::from_vec(cos, (b, max_len, dim), device)?;
+    let sin = Tensor::from_vec(sin, (b, max_len, dim), device)?;
+    Ok((cos, sin))
+}
+
+/// Batched decode positions: one absolute position per row (rows generally
+/// disagree, since ragged prompts finished prefill at different row-relative
+/// lengths), shape `[b, 1, rotary_dim]`.
+pub fn rope_cos_sin_at_rows(cfg: &Config, positions: &[usize], device: &Device) -> Result<(Tensor, Tensor)> {
+    let dim = cfg.rotary_dim();
+    let freq = inv_freq(cfg);
+    let b = positions.len();
+    let mut cos = Vec::with_capacity(b * dim);
+    let mut sin = Vec::with_capacity(b * dim);
+    for &p in positions {
+        let (c, s) = cos_sin_row(dim, &freq, p);
+        cos.extend(c);
+        sin.extend(s);
+    }
+    let cos = Tensor::from_vec(cos, (b, 1, dim), device)?;
+    let sin = Tensor::from_vec(sin, (b, 1, dim), device)?;
+    Ok((cos, sin))
+}

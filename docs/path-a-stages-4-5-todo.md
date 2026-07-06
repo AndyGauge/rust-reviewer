@@ -95,32 +95,87 @@ form was built first (the `seq_len == 1` decode branch in the reference).
 
 ---
 
-## Stage 5 — Batched inference (sequential vs parallel)
+## Stage 5 — Batched inference (sequential vs parallel) — DONE (2026-07-06)
 
 Goal: run the **same PRs as Part 7** (`rust-lang/rust` #158822, #158819, #158814)
 through the Rust reviewer, sequentially vs in a batch, and compare throughput.
 
 ### 5a. Batching
-- [ ] Batch multiple hunk prompts into one forward: **left-pad** to a common length
+- [x] Batch multiple hunk prompts into one forward: **left-pad** to a common length
       (causal models want left padding) + a padding mask added to attention scores.
-- [ ] Handle ragged generation (sequences finish at different lengths — mask
-      finished rows, or stop when all hit EOS).
-- [ ] DeltaNet state + conv state + attention KV all gain a batch dim.
+      `batch::prefill_batch`. Reused the Stage 4c prefill/decode functions by
+      threading optional `pad_mask`/`extra_mask` params through them (`None` = the
+      exact pre-batching behavior, still used by everything through Stage 4c).
+  - Read the reference's actual padding handling rather than guessing: DeltaNet
+    layers zero their mixer input at padded positions *every layer*
+    (`apply_mask_to_padding_states`) — bias-free projections make that an exact
+    zero, so the causal conv and recurrence naturally treat a zeroed left-padded
+    prefix as "no history," no extra logic needed inside either. Attention layers
+    instead rely purely on an additive causal+padding mask. RoPE positions are
+    row-relative to each row's own real content (`cumsum(mask)-1`), not the shared
+    column index — critical and easy to get silently wrong.
+  - **Bug found and fixed:** a padded query row's causally-valid keys are *all*
+    padding too → an all-`-inf` mask row → softmax = 0/0 = NaN → survives the
+    DeltaNet zeroing (`NaN * 0 == NaN`, masking-by-multiply doesn't clean it) →
+    contaminates nearby real tokens through the next conv1d. Fixed by forcing
+    every row's own diagonal unmasked (trivial, harmless self-attention for a
+    position whose output is never read anyway) — guarantees at least one finite
+    entry per row.
+- [x] Handle ragged generation (sequences finish at different lengths — mask
+      finished rows, or stop when all hit EOS). `batch::greedy_generate_batch`:
+      every row keeps decoding structurally (simplest correct approach — no
+      dynamic re-batching), but stops *recording* a row's output at its first EOS;
+      loop stops early once every row has hit EOS.
+- [x] DeltaNet state + conv state + attention KV all gain a batch dim — trivial
+      for DeltaNet (just a batch dim on `S`/`conv_tail`, no ragged-length
+      complication since state size is constant regardless of a row's prompt
+      length); attention's KV cache carries a frozen additive padding mask
+      (`BatchCache.key_pad_base`) that gets extended with zeros each decode step,
+      since those original padded columns must stay masked for the *life* of
+      generation, not just prefill.
 
 ### 5b. The comparison
-- [ ] Feed prompts via `reviewer-run review --dump-prompts prompts.jsonl` (already
-      exists) so the inputs are byte-identical to the harness.
-- [ ] **Sequential:** generate one hunk at a time (batch=1), wall-clock the set.
-- [ ] **Parallel:** generate N hunks in one batch, wall-clock.
-- [ ] Report tokens/sec and hunks/sec for each; find the crossover / best batch.
-- [ ] Cross-check outputs against the Part-7 Python epoch-1 comments (same model →
-      similar comments) as a sanity signal.
+- [x] Feed prompts via `reviewer-run review --dump-prompts prompts.jsonl` (already
+      exists) so the inputs are byte-identical to the harness. Used `gh auth
+      token` for GitHub auth (no token was configured on the dev box or gx10).
+      Fetched all 3 PRs (30 hunks total, 4+1+25); benchmarked a curated 5-hunk
+      subset spanning 211–1095 tokens (a real ragged spread, skipping two ~1000+
+      token outlier `.stderr` dumps that would've swamped the signal).
+- [x] **Verify first:** `verify-batch` diffs each row's batched output against
+      that same prompt run alone through the trusted Stage 4c single-sequence
+      cache (no Python oracle exists for "batched candle," so the single-sequence
+      path is the ground truth here). **All 5 rows matched exactly** — same
+      token-for-token generated ids, same lengths — despite differing prompt
+      lengths and padding amounts, confirming the padding mask, DeltaNet zeroing,
+      per-row RoPE, and growing decode mask are all correct together.
+- [x] **Sequential:** generate one hunk at a time (batch=1), wall-clock the set.
+- [x] **Parallel:** generate N hunks in one batch, wall-clock.
+- [x] Report tokens/sec and hunks/sec for each. Result (5 hunks, max 64 new
+      tokens, all rows hit EOS naturally — 74 tokens total either way):
+      sequential 97.8s (0.76 tok/s, 0.05 hunks/s) vs parallel 74.0s (1.00 tok/s,
+      0.07 hunks/s) — **1.32x wall-clock speedup**. Less than a naive "5x," as
+      expected: batched prefill pays the cost of processing every row up to the
+      *longest* row's length (1095), which is wasted compute for the four
+      shorter rows, partially offsetting decode's bandwidth win. Didn't sweep
+      batch sizes for the exact crossover point — one clean, honest measurement
+      was the goal, not an exhaustive tuning pass.
+- [x] Cross-check outputs: sequential and parallel produced *identical* comments
+      for all 5 rows (expected, given `verify-batch`'s exact match) — real,
+      plausible rustc review comments (e.g. *"I think this is a regression,
+      right?"*, *"I'm not sure if this is the right way to do it, but it seems to
+      work."*), consistent in tone with every prior stage's milestone output.
 
 ### 5c. Interpretation (the blog beat)
-- [ ] Tie back to [blog 6](blog-06-learn-the-controller.md): decode is
+- [x] Tie back to [blog 6](blog-06-learn-the-controller.md): decode is
       bandwidth-bound, so batching amortizes the per-token weight read — expect
       parallel to win on aggregate throughput once the batch fills, bounded by
-      KV/state memory. Measure it; don't assume it.
+      KV/state memory. Measure it; don't assume it. **Measured: parallel does
+      win (1.32x), but by less than intuition suggests**, because prefill (not
+      modeled by the bandwidth argument, which is specifically about decode)
+      pays a real ragged-padding tax that the naive "N sequences → N× throughput"
+      story ignores. Both things are true at once — the theme holds up under
+      an actual number, but the number is smaller and more interesting than the
+      hand-wave.
 
 ---
 
