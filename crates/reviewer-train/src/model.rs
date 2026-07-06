@@ -142,15 +142,15 @@ const HIDDEN: usize = 4096;
 const FULL_ATTN_INTERVAL: usize = 4; // every 4th layer is full attention
 
 /// Load the 9B's language-model + lm_head weights from a directory of sharded
-/// safetensors, cast to f32 (the vision tower is skipped).
-pub fn load_weights(dir: &Path) -> Result<HashMap<String, Tensor>> {
+/// safetensors onto `device`, cast to f32 (the vision tower is skipped).
+pub fn load_weights(dir: &Path, device: &Device) -> Result<HashMap<String, Tensor>> {
     let mut w = HashMap::new();
     for entry in std::fs::read_dir(dir).map_err(candle_core::Error::wrap)? {
         let path = entry.map_err(candle_core::Error::wrap)?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
             continue;
         }
-        for (k, v) in safetensors::load(&path, &Device::Cpu)? {
+        for (k, v) in safetensors::load(&path, device)? {
             if k.starts_with("model.language_model.") || k.starts_with("lm_head.") {
                 w.insert(k, v.to_dtype(DType::F32)?);
             }

@@ -75,10 +75,12 @@ fn main() -> Result<()> {
 }
 
 fn verify_model(oracle: &PathBuf, weights: &PathBuf) -> Result<()> {
-    let o = safetensors::load(oracle, &Device::Cpu)
+    let dev = Device::cuda_if_available(0)?;
+    println!("device: {dev:?}");
+    let o = safetensors::load(oracle, &dev)
         .with_context(|| format!("loading {}", oracle.display()))?;
     println!("loading 9B weights from {} …", weights.display());
-    let w = model::load_weights(weights)?;
+    let w = model::load_weights(weights, &dev)?;
     println!("  loaded {} language-model tensors", w.len());
 
     let logits = model::full_model_forward(&w, &o["input_ids"], &o["cos"], &o["sin"])?;
