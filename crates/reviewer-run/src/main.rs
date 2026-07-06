@@ -19,6 +19,7 @@ mod critic;
 mod diff;
 mod findings;
 mod github;
+mod judge;
 mod render;
 
 use concurrency::AdaptiveLimiter;
@@ -45,6 +46,9 @@ enum Cmd {
     Review(ReviewArgs),
     /// Human-in-the-loop: annotate findings with verdicts (the judge's labels).
     Label(LabelArgs),
+    /// Automated judge: a judge model renders a verdict on every finding, in
+    /// parallel, recorded in the `machine` field (kept apart from human labels).
+    Judge(JudgeArgs),
 }
 
 #[derive(Parser)]
@@ -104,12 +108,78 @@ struct LabelArgs {
     judged_by: String,
 }
 
+#[derive(Parser)]
+struct JudgeArgs {
+    /// The findings JSONL to judge in place (verdicts written to `machine`).
+    #[arg(long, default_value = "findings.jsonl")]
+    findings: PathBuf,
+    /// OpenAI-compatible base URL of the judge model, e.g. `http://spark:8001/v1`.
+    #[arg(long)]
+    endpoint: String,
+    /// Judge model name — the base model, distinct from the critic LoRA.
+    #[arg(long, default_value = "Qwen/Qwen3.6-27B")]
+    model: String,
+    /// Bearer token for the endpoint, if it requires one.
+    #[arg(long, env = "REVIEWER_API_KEY")]
+    api_key: Option<String>,
+    /// Recorded as `judged_by` on each machine verdict.
+    #[arg(long, default_value = "Qwen3.6-27B")]
+    judged_by: String,
+    /// How many findings to judge concurrently (the endpoint batches them).
+    #[arg(long, default_value_t = 8)]
+    concurrency: usize,
+    /// Re-judge findings that already carry a machine verdict.
+    #[arg(long)]
+    rejudge: bool,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Review(a) => review(a).await,
         Cmd::Label(a) => label(a),
+        Cmd::Judge(a) => judge_cmd(a).await,
     }
+}
+
+/// Stage 7 (automated): run a judge model over every unjudged finding in parallel.
+async fn judge_cmd(args: JudgeArgs) -> Result<()> {
+    let mut items = findings::load(&args.findings)?;
+    let pending = items
+        .iter()
+        .filter(|f| args.rejudge || f.machine.is_none())
+        .count();
+    if pending == 0 {
+        eprintln!("all {} findings already judged (use --rejudge to redo).", items.len());
+        return Ok(());
+    }
+    let judge = judge::HttpJudge::new(&args.endpoint, &args.model, args.api_key.clone(), &args.judged_by)?;
+    eprintln!(
+        "judging {pending} of {} findings with {} (concurrency {}) …",
+        items.len(),
+        args.model,
+        args.concurrency,
+    );
+    let t = std::time::Instant::now();
+    let n = judge::judge_all(&judge, &mut items, args.concurrency, args.rejudge).await?;
+    findings::save(&args.findings, &items)?;
+
+    let (mut acc, mut rej, mut uns) = (0usize, 0usize, 0usize);
+    for f in &items {
+        if let Some(m) = &f.machine {
+            match m.verdict {
+                Verdict::Accept => acc += 1,
+                Verdict::Reject => rej += 1,
+                Verdict::Unsure => uns += 1,
+            }
+        }
+    }
+    eprintln!(
+        "judged {n} in {:.1}s · accept {acc} · reject {rej} · unsure {uns} -> {}",
+        t.elapsed().as_secs_f64(),
+        args.findings.display(),
+    );
+    Ok(())
 }
 
 async fn review(args: ReviewArgs) -> Result<()> {

@@ -137,6 +137,29 @@ pub struct CriticFinding {
     /// Human verdict — `None` until reviewed. This is the label the judge trains on.
     #[serde(default)]
     pub human: Option<HumanLabel>,
+
+    /// Automated judge verdict — a second opinion from a *judge model* (e.g. the
+    /// base model), `None` until judged. Deliberately **separate** from `human`:
+    /// machine verdicts are a cheap first pass and a training signal, but they are
+    /// not gold, and letting them masquerade as human labels would quietly train
+    /// the judge on its own base model's opinions. Keep the two streams distinct
+    /// so either can be filtered out.
+    #[serde(default)]
+    pub machine: Option<MachineLabel>,
+}
+
+/// A judge *model's* verdict on one [`CriticFinding`] — the automated analogue of
+/// [`HumanLabel`]. Same verdict vocabulary, but tagged with which model spoke and
+/// kept in its own field so it never contaminates the human gold set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MachineLabel {
+    pub verdict: Verdict,
+    /// One-sentence rationale the judge gave, verbatim.
+    #[serde(default)]
+    pub reason: Option<String>,
+    pub judged_at: String,
+    /// Which judge model produced this, e.g. `Qwen3.6-27B`.
+    pub judged_by: String,
 }
 
 /// A human's judgment of one [`CriticFinding`] — the training target for the

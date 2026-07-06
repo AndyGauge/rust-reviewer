@@ -136,6 +136,7 @@ pub async fn collect<C: Critic>(
                 cited_line: c.cited_line,
                 grounded,
                 human: None,
+                machine: None,
             });
         }
     }
