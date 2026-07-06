@@ -12,8 +12,10 @@
 mod chat;
 mod config;
 mod delta;
+mod generate;
 mod mixer;
 mod model;
+mod rope;
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -96,6 +98,65 @@ enum Cmd {
         #[arg(long)]
         oracle: PathBuf,
     },
+    /// Stage 4b: greedy-generate one reviewer comment for a (system, user)
+    /// fixture, no KV cache (re-runs the full forward every new token).
+    Generate {
+        /// The (system, user) JSON from `dump-chat-fixture`.
+        #[arg(long)]
+        fixture: PathBuf,
+        /// `tokenizer.json` from the HF snapshot.
+        #[arg(long)]
+        tokenizer: PathBuf,
+        /// Directory of the model's sharded safetensors weights.
+        #[arg(long)]
+        weights: PathBuf,
+        /// Model config.json (dims). Defaults to the 9B if omitted.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Load weights in bf16 (for the 27B, which doesn't fit in f32).
+        #[arg(long)]
+        bf16: bool,
+        /// Merge a PEFT LoRA adapter_model.safetensors before running.
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// LoRA scale (alpha/r); epoch-1 adapter is 64/32 = 2.0.
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
+        #[arg(long, default_value_t = 128)]
+        max_new_tokens: usize,
+    },
+    /// Verify greedy generation (no KV cache) against a Python greedy-decode
+    /// oracle (`train/greedy_oracle.py`, `do_sample=False`) on the same
+    /// fixture — token-for-token, for as many tokens as the oracle generated.
+    VerifyGenerate {
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        bf16: bool,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long, default_value_t = 2.0)]
+        lora_scale: f64,
+        /// Oracle safetensors: "ids" (prompt+generated) and "prompt_len".
+        #[arg(long)]
+        oracle: PathBuf,
+    },
+    /// Verify `rope::rope_cos_sin`'s self-computed table against the real
+    /// `rotary_emb` module's cos/sin (from `train/step_oracle.py`), with no
+    /// model load — isolates a RoPE bug from ordinary bf16 forward-pass drift.
+    VerifyRope {
+        /// Oracle safetensors with "cos"/"sin" (shape `[1,s,rd]` or `[s,rd]`).
+        #[arg(long)]
+        oracle: PathBuf,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -112,7 +173,135 @@ fn main() -> Result<()> {
         Cmd::VerifyChatTemplate { fixture, tokenizer, oracle } => {
             verify_chat_template(&fixture, &tokenizer, &oracle)
         }
+        Cmd::Generate { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
+            generate_cmd(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        }
+        Cmd::VerifyGenerate { fixture, tokenizer, weights, config, bf16, adapter, lora_scale, oracle } => {
+            verify_generate(&fixture, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, &oracle)
+        }
+        Cmd::VerifyRope { oracle, config } => verify_rope(&oracle, config.as_deref()),
     }
+}
+
+fn verify_rope(oracle: &PathBuf, config: Option<&std::path::Path>) -> Result<()> {
+    let cfg = match config {
+        Some(p) => Config::from_json(p)?,
+        None => Config::qwen9b(),
+    };
+    let o = safetensors::load(oracle, &Device::Cpu)
+        .with_context(|| format!("loading {}", oracle.display()))?;
+    let exp_cos = o["cos"].to_dtype(candle_core::DType::F32)?;
+    let exp_sin = o["sin"].to_dtype(candle_core::DType::F32)?;
+    // oracle tensors may be [1,s,rd] or [s,rd]; normalize to [1,s,rd].
+    let exp_cos = if exp_cos.dims().len() == 2 { exp_cos.unsqueeze(0)? } else { exp_cos };
+    let exp_sin = if exp_sin.dims().len() == 2 { exp_sin.unsqueeze(0)? } else { exp_sin };
+    let s = exp_cos.dim(1)?;
+
+    let (got_cos, got_sin) = rope::rope_cos_sin(&cfg, s, &Device::Cpu)?;
+    println!("seq_len={s}, rotary_dim={}", cfg.rotary_dim());
+    // The model casts cos/sin to bf16 before use (see model::full_model_forward),
+    // and this oracle round-tripped through that same cast, so tolerance is one
+    // bf16 ULP near 1.0 (~2^-7 ≈ 7.8e-3), not float32 precision.
+    compare(&got_cos, &exp_cos, "rope cos table", 8e-3)?;
+    compare(&got_sin, &exp_sin, "rope sin table", 8e-3)?;
+    Ok(())
+}
+
+/// Shared setup for `Generate`/`VerifyGenerate`: config, device, weights (+LoRA).
+fn load_model_for_generation(
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+) -> Result<(Config, candle_core::Device, std::collections::HashMap<String, candle_core::Tensor>)> {
+    let cfg = match config {
+        Some(p) => Config::from_json(p)?,
+        None => Config::qwen9b(),
+    };
+    let dtype = if bf16 { candle_core::DType::BF16 } else { candle_core::DType::F32 };
+    let dev = Device::cuda_if_available(0)?;
+    println!("config: {} layers, hidden {}, dtype {dtype:?}, device {dev:?}", cfg.n_layers, cfg.hidden);
+    println!("loading weights from {} …", weights.display());
+    let mut w = model::load_weights(weights, &dev, dtype)?;
+    println!("  loaded {} language-model tensors", w.len());
+    if let Some(ad) = adapter {
+        println!("merging LoRA adapter {} …", ad.display());
+        model::apply_lora(&mut w, ad, lora_scale, dtype)?;
+    }
+    Ok((cfg, dev, w))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generate_cmd(
+    fixture: &PathBuf,
+    tokenizer: &PathBuf,
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+    max_new_tokens: usize,
+) -> Result<()> {
+    let fx = chat::ChatFixture::load(fixture)?;
+    let text = chat::render_prompt(&fx.system, &fx.user);
+    let tok = chat::load_tokenizer(tokenizer)?;
+    let prompt_ids = chat::encode(&tok, &text)?;
+    let eos = chat::eos_ids(&tok);
+    println!("prompt: {} tokens", prompt_ids.len());
+
+    let (cfg, dev, w) = load_model_for_generation(weights, config, bf16, adapter, lora_scale)?;
+    let ids = generate::greedy_generate(&w, &cfg, &prompt_ids, max_new_tokens, &eos, &dev)?;
+    let new_ids = &ids[prompt_ids.len()..];
+    println!("generated {} new tokens: {new_ids:?}", new_ids.len());
+    println!("comment:\n{}", chat::decode(&tok, new_ids)?);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_generate(
+    fixture: &PathBuf,
+    tokenizer: &PathBuf,
+    weights: &PathBuf,
+    config: Option<&std::path::Path>,
+    bf16: bool,
+    adapter: Option<&std::path::Path>,
+    lora_scale: f64,
+    oracle: &PathBuf,
+) -> Result<()> {
+    let fx = chat::ChatFixture::load(fixture)?;
+    let text = chat::render_prompt(&fx.system, &fx.user);
+    let tok = chat::load_tokenizer(tokenizer)?;
+    let prompt_ids = chat::encode(&tok, &text)?;
+    let eos = chat::eos_ids(&tok);
+
+    let o = safetensors::load(oracle, &Device::Cpu)
+        .with_context(|| format!("loading {}", oracle.display()))?;
+    let exp_ids: Vec<i64> = o["ids"].to_vec1()?;
+    let prompt_len: Vec<i64> = o["prompt_len"].to_vec1()?;
+    let prompt_len = prompt_len[0] as usize;
+    anyhow::ensure!(
+        prompt_len == prompt_ids.len(),
+        "prompt length mismatch before generation even starts: rust={} python={prompt_len} \
+         (Stage 4a template/tokenizer drift — re-run verify-chat-template)",
+        prompt_ids.len()
+    );
+    let max_new = exp_ids.len() - prompt_len;
+    println!("prompt: {prompt_len} tokens, oracle generated {max_new} new tokens");
+
+    let (cfg, dev, w) = load_model_for_generation(weights, config, bf16, adapter, lora_scale)?;
+    let got_ids = generate::greedy_generate(&w, &cfg, &prompt_ids, max_new, &eos, &dev)?;
+
+    println!("rust   ({}): {got_ids:?}", got_ids.len());
+    println!("python ({}): {exp_ids:?}", exp_ids.len());
+    let n = got_ids.len().min(exp_ids.len());
+    let hits = got_ids.iter().zip(&exp_ids).take(n).filter(|(a, b)| **a as i64 == **b).count();
+    if let Some((i, (a, b))) = got_ids.iter().zip(&exp_ids).enumerate().find(|(_, (a, b))| **a as i64 != **b) {
+        println!("  first mismatch at index {i} (position {} of the generated suffix): rust={a} python={b}", i as i64 - prompt_len as i64);
+    }
+    println!("  {hits}/{n} tokens match, lengths: rust={} python={}", got_ids.len(), exp_ids.len());
+    println!("  {}", if hits == n && got_ids.len() == exp_ids.len() { "MATCH ✓" } else { "MISMATCH ✗" });
+    Ok(())
 }
 
 fn verify_chat_template(fixture: &PathBuf, tokenizer: &PathBuf, oracle: &PathBuf) -> Result<()> {

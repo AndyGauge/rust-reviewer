@@ -40,6 +40,23 @@ pub fn encode(tok: &Tokenizer, text: &str) -> Result<Vec<u32>> {
     Ok(enc.get_ids().to_vec())
 }
 
+/// Decode generated ids back to text, dropping special tokens (`<|im_end|>`
+/// and friends) so the output is just the reviewer's comment.
+pub fn decode(tok: &Tokenizer, ids: &[u32]) -> Result<String> {
+    tok.decode(ids, true).map_err(|e| anyhow::anyhow!("decoding: {e}"))
+}
+
+/// The ids that end generation: `<|im_end|>` (end of turn) and `<|endoftext|>`
+/// (the pad/eos fallback) — same pair as `generation_config.json`'s
+/// `eos_token_id`, looked up by name so this doesn't drift if vocab ids shift
+/// between the 9B and 27B tokenizers.
+pub fn eos_ids(tok: &Tokenizer) -> Vec<u32> {
+    ["<|im_end|>", "<|endoftext|>"]
+        .into_iter()
+        .filter_map(|t| tok.token_to_id(t))
+        .collect()
+}
+
 /// The fixture fed to both sides of the byte-match check: the exact
 /// `reviewer-core` system prompt + one concrete diff hunk through
 /// `reviewer_core::user_prompt`, serialized so a Python oracle script can

@@ -22,6 +22,10 @@ pub struct Config {
     pub n_heads: usize,
     pub n_kv_heads: usize,
     pub head_dim: usize,
+    // RoPE (text rotary — mrope collapses to plain RoPE for text-only input,
+    // see reviewer-train::rope).
+    pub rope_theta: f64,
+    pub partial_rotary_factor: f64,
 }
 
 impl Config {
@@ -38,6 +42,11 @@ impl Config {
     pub fn is_full_attn(&self, i: usize) -> bool {
         (i + 1) % self.full_attn_interval == 0
     }
+    /// Rotary dim: only the first `head_dim * partial_rotary_factor` dims of
+    /// each head are rotated (the rest pass through RoPE unchanged).
+    pub fn rotary_dim(&self) -> usize {
+        (self.head_dim as f64 * self.partial_rotary_factor) as usize
+    }
 
     pub fn from_json(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).map_err(candle_core::Error::wrap)?;
@@ -53,6 +62,11 @@ impl Config {
         let getf = |k: &str, default: f64| -> f64 {
             t.get(k).or_else(|| v.get(k)).and_then(|x| x.as_f64()).unwrap_or(default)
         };
+        // rope_theta / partial_rotary_factor live under text_config.rope_parameters.
+        let rope = t.get("rope_parameters").or_else(|| v.get("rope_parameters"));
+        let getf_rope = |k: &str, default: f64| -> f64 {
+            rope.and_then(|r| r.get(k)).and_then(|x| x.as_f64()).unwrap_or(default)
+        };
         Ok(Config {
             hidden: get("hidden_size")? as usize,
             n_layers: get("num_hidden_layers")? as usize,
@@ -67,6 +81,8 @@ impl Config {
             n_heads: get("num_attention_heads")? as usize,
             n_kv_heads: get("num_key_value_heads")? as usize,
             head_dim: get("head_dim")? as usize,
+            rope_theta: getf_rope("rope_theta", 10_000_000.0),
+            partial_rotary_factor: getf_rope("partial_rotary_factor", 0.25),
         })
     }
 
@@ -76,6 +92,7 @@ impl Config {
             hidden: 4096, n_layers: 32, vocab: 248320, full_attn_interval: 4, eps: 1e-6,
             nv: 32, nk: 16, dk: 128, dv: 128, conv_kernel: 4,
             n_heads: 16, n_kv_heads: 4, head_dim: 256,
+            rope_theta: 10_000_000.0, partial_rotary_factor: 0.25,
         }
     }
 }

@@ -29,16 +29,30 @@ reference** at each step (the oracle method). Reuse `reviewer-core` /
         Rust and diffs. **214/214 tokens byte-identical.** (Oracle script is
         tokenizer-only — no torch needed, runs in a small local venv.)
 
-### 4b. Greedy generation, NO KV cache first (correctness)
-- [ ] Loop: prefill the prompt → take last-position logits → argmax (greedy) →
+### 4b. Greedy generation, NO KV cache first (correctness) — DONE (2026-07-06)
+- [x] Loop: prefill the prompt → take last-position logits → argmax (greedy) →
       append → repeat until EOS or `max_new_tokens`. Re-run the *whole* forward each
       step (O(n²), slow, but reuses the verified `full_model_forward` unchanged).
-- [ ] Decode generated ids → text.
-- [ ] **Verify:** greedy-generate on a fixed prompt; compare the produced token
-      sequence to Python greedy (`do_sample=False`) on the merged model. Should
-      match exactly for a few dozen tokens.
-- [ ] Milestone: the Rust reviewer emits one real comment on one rustc hunk.
-      (Slow is fine here — proves the end-to-end path.)
+      `generate::greedy_generate` in `reviewer-train`.
+- [x] Decode generated ids → text. `chat::decode`; EOS = `<|im_end|>` /
+      `<|endoftext|>` looked up by name (`chat::eos_ids`).
+- [x] **Verify:** `train/greedy_oracle.py` runs real `generate(do_sample=False)`
+      on base+LoRA for the Stage 4a fixture; `reviewer-train verify-generate`
+      replays the same fixture through the Rust loop and diffs token ids.
+      Result: **18/19 generated tokens matched exactly**; the one divergence
+      (position 2) was run down with two new model-free/cheap diagnostics
+      (`train/step_oracle.py` + `reviewer-train verify-rope`) and traced to a
+      genuine bf16 tie — both candidate tokens' logits round to the *exact same*
+      bf16 value (18.125). `verify-rope` also confirms our self-computed RoPE
+      table (`rope::rope_cos_sin`, needed now that generation grows past the
+      fixed oracle-supplied cos/sin) matches the real `rotary_emb` to within one
+      bf16 ULP (~8e-3), i.e. exactly. This is the "silent bf16 precision drift"
+      risk called out below — expected, not a bug, and not fixable by more
+      careful Rust code since both frameworks are equally "correct" at a tie.
+- [x] Milestone: the Rust reviewer emits one real comment on one rustc hunk —
+      e.g. *"I'm not sure if this is the ..."* / (Python's greedy decode on the
+      same prompt: *"I think this is a bugfix, but I'm not sure if it's
+      intentional."*, diverging only after the tie above).
 
 ### 4c. KV cache (make it not-slow) — the real work
 The hybrid arch needs **two** kinds of cached state; this is why the recurrent
