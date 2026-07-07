@@ -22,6 +22,7 @@
 - [The fast path was a door we assumed was locked](blog-16-the-fast-path.md)
 - [You can't proofread your own blind spot](blog-17-you-cant-proofread-your-own-blind-spot.md)
 - [Twenty-six in, six out](blog-18-twenty-six-in-six-out.md)
+- [The trainer that never trained](blog-19-the-trainer-that-never-trained.md)
 
 # Project Notes
 
