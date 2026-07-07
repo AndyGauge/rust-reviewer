@@ -25,6 +25,7 @@
 
 # Project Notes
 
+- [The crates](crates.md)
 - [Training log](training-log.md)
 - [Harness plan](harness-plan.md)
 - [Path A — stages 4–5 to-do](path-a-stages-4-5-todo.md)

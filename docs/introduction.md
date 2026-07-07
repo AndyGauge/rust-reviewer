@@ -30,6 +30,10 @@ The parts are meant to be read in order; each one is a specific problem and the
 measurement that resolved it. If you only read a few, the recurring lesson is the
 same: **measure it, because the answer changes when the operation does.**
 
+The whole thing is one Cargo workspace of five small crates —
+[`reviewer-extract`](crates.md), `-prepare`, `-train`, `-run`, and `-core` — laid
+out in [The crates](crates.md), each linked to its source on GitHub.
+
 Start at [Part 1](blog-01-building-an-all-rust-reviewer.md). The
 [project notes](training-log.md) at the end hold the running log and the plans the
 posts refer back to.
