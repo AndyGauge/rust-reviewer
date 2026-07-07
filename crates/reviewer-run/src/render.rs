@@ -72,6 +72,7 @@ pub fn report(
         .unwrap_or("none");
     let grounded = findings.iter().filter(|f| f.grounded).count();
     let judged = findings.iter().filter(|f| f.human.is_some()).count();
+    let machine_judged = findings.iter().filter(|f| f.machine.is_some()).count();
     let stub_note = if model == "stub" {
         " <b>(stub — no adapter wired yet)</b>"
     } else {
@@ -80,7 +81,7 @@ pub fn report(
     let _ = write!(
         s,
         "<div class=\"banner\">Critic: <code>{}</code>{} · {} findings over {} files / \
-         {} hunks · {} grounded · {} human-judged</div>\n",
+         {} hunks · {} grounded · {} human-judged · {} machine-judged</div>\n",
         esc(model),
         stub_note,
         findings.len(),
@@ -88,6 +89,7 @@ pub fn report(
         hunks,
         grounded,
         judged,
+        machine_judged,
     );
 
     // Incomplete-run warning: failed hunks might have held the real finding, so a
@@ -154,20 +156,46 @@ pub fn report(
                 } else {
                     " <span class=\"tag ungrounded\">ungrounded</span>"
                 };
-                let verdict = match finding.human.as_ref().map(|h| h.verdict) {
+                let human_tag = match finding.human.as_ref().map(|h| h.verdict) {
                     Some(Verdict::Accept) => " <span class=\"tag accept\">accepted</span>",
                     Some(Verdict::Reject) => " <span class=\"tag reject\">rejected</span>",
                     Some(Verdict::Unsure) => " <span class=\"tag unsure\">unsure</span>",
-                    None => " <span class=\"tag pending\">unjudged</span>",
+                    None => "",
+                };
+                // The judge model's verdict, shown as an outlined tag so it reads
+                // as a distinct (machine) second opinion, not a human label.
+                let machine_tag = match finding.machine.as_ref().map(|m| m.verdict) {
+                    Some(Verdict::Accept) => " <span class=\"tag jaccept\">judge: accept</span>",
+                    Some(Verdict::Reject) => " <span class=\"tag jreject\">judge: reject</span>",
+                    Some(Verdict::Unsure) => " <span class=\"tag junsure\">judge: unsure</span>",
+                    None => "",
+                };
+                let pending = if finding.human.is_none() && finding.machine.is_none() {
+                    " <span class=\"tag pending\">unjudged</span>"
+                } else {
+                    ""
                 };
                 let _ = write!(
                     s,
-                    "<div class=\"cmt critic\"><span class=\"who\">critic</span>{}{}{} {}</div>\n",
+                    "<div class=\"cmt critic\"><span class=\"who\">critic</span>{}{}{}{}{} {}</div>\n",
                     anchor,
                     ground,
-                    verdict,
+                    human_tag,
+                    machine_tag,
+                    pending,
                     esc(&truncate(&finding.critic_comment, 800)),
                 );
+                // The judge's rationale, as its own voice under the critic's comment.
+                if let Some(m) = &finding.machine {
+                    if let Some(reason) = m.reason.as_deref().map(strip_verdict).filter(|r| !r.is_empty()) {
+                        let _ = write!(
+                            s,
+                            "<div class=\"cmt judge-reason\"><span class=\"who\">{}</span>{}</div>\n",
+                            esc(&m.judged_by),
+                            esc(&truncate(reason, 600)),
+                        );
+                    }
+                }
             }
         }
 
@@ -208,6 +236,18 @@ fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Drop a leading verdict word (ACCEPT/REJECT/UNSURE) the judge often prefixes
+/// its rationale with, so the report shows only the reasoning.
+fn strip_verdict(s: &str) -> &str {
+    let t = s.trim_start();
+    for w in ["ACCEPT", "REJECT", "UNSURE", "Accept", "Reject", "Unsure"] {
+        if let Some(rest) = t.strip_prefix(w) {
+            return rest.trim_start_matches([':', '.', ',', ' ', '\n', '\r', '-']);
+        }
+    }
+    t
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -239,6 +279,11 @@ h2.file{margin-top:2rem;border-top:1px solid #e0e0e2;padding-top:1rem}
 .tag.ungrounded{background:#ffe0e0;color:#82071e}
 .tag.accept{background:#d3f8d3;color:#0a5223}.tag.reject{background:#ffe0e0;color:#82071e}
 .tag.unsure{background:#fff3cd;color:#7a5c00}.tag.pending{background:#eee;color:#666}
+.tag.jaccept{background:transparent;border:1px solid #1a7f37;color:#0a5223}
+.tag.jreject{background:transparent;border:1px solid #cf222e;color:#82071e}
+.tag.junsure{background:transparent;border:1px solid #bf8700;color:#7a5c00}
+.cmt.judge-reason{border-left-color:#8250df;background:#faf7ff;margin-left:1.4rem;color:#444;font-size:.95em}
+.cmt.judge-reason .who{color:#8250df;font-weight:600}
 table.hunk{border-collapse:collapse;width:100%;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;\
 margin:.5rem 0;overflow-x:auto;display:block}
 table.hunk td{padding:0 .5em;white-space:pre;vertical-align:top}

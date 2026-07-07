@@ -49,6 +49,10 @@ enum Cmd {
     /// Automated judge: a judge model renders a verdict on every finding, in
     /// parallel, recorded in the `machine` field (kept apart from human labels).
     Judge(JudgeArgs),
+    /// Re-render a findings JSONL to HTML without re-running the critic — fetch +
+    /// segment the PR (deterministic), then render the stored findings and their
+    /// verdicts. Optionally filter to only accepted/rejected/unsure findings.
+    Render(RenderArgs),
 }
 
 #[derive(Parser)]
@@ -133,13 +137,81 @@ struct JudgeArgs {
     rejudge: bool,
 }
 
+#[derive(Parser)]
+struct RenderArgs {
+    /// `owner/name`, e.g. `rust-lang/rust`.
+    #[arg(long)]
+    repo: String,
+    /// Pull-request number.
+    #[arg(long)]
+    pr: u64,
+    /// GitHub token (public-repo read is enough).
+    #[arg(long, env = "GITHUB_TOKEN")]
+    token: String,
+    /// The findings JSONL to render (already reviewed / judged).
+    #[arg(long, default_value = "findings.jsonl")]
+    findings: PathBuf,
+    /// HTML report path.
+    #[arg(long, default_value = "review.html")]
+    out: PathBuf,
+    /// Keep only findings with this judge (machine) verdict: accepted/rejected/unsure.
+    /// When set, the diff is trimmed to just the hunks that produced a kept finding.
+    #[arg(long)]
+    filter: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Review(a) => review(a).await,
         Cmd::Label(a) => label(a),
         Cmd::Judge(a) => judge_cmd(a).await,
+        Cmd::Render(a) => render_cmd(a).await,
     }
+}
+
+/// Re-render a stored findings file — no critic call, just fetch + segment + render.
+async fn render_cmd(args: RenderArgs) -> Result<()> {
+    let client = github::Client::new(args.token.clone())?;
+    eprintln!("fetching {} #{} …", args.repo, args.pr);
+    let pr = client.fetch(&args.repo, args.pr).await?;
+    let mut files = diff::parse(&pr.diff);
+
+    let store = findings::load(&args.findings)?;
+    let mut this_pr: Vec<reviewer_core::CriticFinding> = store
+        .into_iter()
+        .filter(|f| f.pr == Some(args.pr) && f.repo == args.repo)
+        .collect();
+
+    if let Some(filt) = args.filter.as_deref() {
+        let want = match filt {
+            "accepted" | "accept" => Verdict::Accept,
+            "rejected" | "reject" => Verdict::Reject,
+            "unsure" => Verdict::Unsure,
+            other => anyhow::bail!("--filter must be accepted|rejected|unsure, got `{other}`"),
+        };
+        this_pr.retain(|f| f.machine.as_ref().map(|m| m.verdict) == Some(want));
+        // Trim the diff to only the files/hunks that produced a kept finding, so
+        // the report is a focused view of just those findings.
+        let keep: std::collections::HashSet<(String, String)> = this_pr
+            .iter()
+            .map(|f| (f.path.clone(), f.hunk_header.clone()))
+            .collect();
+        let paths: std::collections::HashSet<String> =
+            this_pr.iter().map(|f| f.path.clone()).collect();
+        files.retain(|f| paths.contains(&f.path));
+        for f in &mut files {
+            let p = f.path.clone();
+            f.hunks.retain(|h| keep.contains(&(p.clone(), h.header.clone())));
+        }
+    }
+
+    let html = render::report(&pr, &files, &this_pr, 0);
+    std::fs::write(&args.out, &html)
+        .with_context(|| format!("writing {}", args.out.display()))?;
+    eprintln!("rendered {} findings -> {}", this_pr.len(), args.out.display());
+    eprintln!("open: file://{}", args.out.canonicalize()?.display());
+    Ok(())
 }
 
 /// Stage 7 (automated): run a judge model over every unjudged finding in parallel.
