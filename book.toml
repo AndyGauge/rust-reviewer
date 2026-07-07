@@ -1,0 +1,18 @@
+[book]
+title = "Reviewing Rust, in Rust"
+authors = ["Andy Gauge"]
+description = "An 18-part build log: training and serving an all-Rust design-review model for the Rust compiler."
+src = "docs"
+language = "en"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/AndyGauge/rust-reviewer"
+edit-url-template = "https://github.com/AndyGauge/rust-reviewer/edit/master/{path}"
+site-url = "/rust-reviewer/"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1

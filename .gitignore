@@ -22,6 +22,9 @@ __pycache__/
 findings.jsonl
 *.findings.jsonl
 
+# mdBook build output (published to GitHub Pages by CI, not committed)
+/book
+
 # macOS
 .DS_Store
 
