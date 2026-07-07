@@ -19,6 +19,7 @@ mod mixer;
 mod model;
 mod rope;
 mod serve;
+mod train;
 
 use anyhow::{Context, Result};
 use config::Config;
@@ -260,6 +261,52 @@ enum Cmd {
         #[arg(long, default_value_t = 256)]
         max_new_tokens: usize,
     },
+    /// Path A training: an all-Rust (candle) LoRA SFT run. Freezes the base
+    /// weights, trains low-rank `A`/`B` on the projection linears via masked
+    /// next-token cross-entropy + AdamW, and writes a PEFT-format adapter.
+    Train {
+        /// HF snapshot dir of the base model's sharded safetensors.
+        #[arg(long)]
+        weights: PathBuf,
+        /// `tokenizer.json` from the snapshot.
+        #[arg(long)]
+        tokenizer: PathBuf,
+        /// Prepared chat JSONL (repeatable).
+        #[arg(long)]
+        data: Vec<PathBuf>,
+        /// Output adapter directory.
+        #[arg(long)]
+        out: PathBuf,
+        /// Model config.json (dims). Defaults to `{weights}/config.json`, then the 9B.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value_t = 32)]
+        rank: usize,
+        #[arg(long, default_value_t = 64.0)]
+        alpha: f64,
+        #[arg(long, default_value_t = 1e-4)]
+        lr: f64,
+        /// Max tokens per example (prompt front-truncated to fit; caps the
+        /// recurrence-unroll depth the backward graph has to hold).
+        #[arg(long, default_value_t = 512)]
+        max_seq: usize,
+        #[arg(long, default_value_t = 1)]
+        epochs: usize,
+        /// Cap the number of examples (for a quick proof run).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Also adapt the (large) MLP projections, not just attention/mixer.
+        #[arg(long)]
+        all_linears: bool,
+        /// Load the base weights in bf16 (recommended — halves the memory the
+        /// backward graph competes with).
+        #[arg(long)]
+        bf16: bool,
+        #[arg(long, default_value_t = 20)]
+        log_every: usize,
+        #[arg(long, default_value_t = 500)]
+        save_every: usize,
+    },
 }
 
 fn main() -> Result<()> {
@@ -292,6 +339,13 @@ fn main() -> Result<()> {
         Cmd::Serve { weights, tokenizer, config, bf16, adapter, lora_scale, model_name, port, max_new_tokens } => {
             serve::serve(&weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, &tokenizer, model_name, port, max_new_tokens)
         }
+        Cmd::Train {
+            weights, tokenizer, data, out, config, rank, alpha, lr, max_seq, epochs, limit,
+            all_linears, bf16, log_every, save_every,
+        } => train::run(
+            &weights, &tokenizer, &data, &out, config.as_deref(), rank, alpha, lr, max_seq, epochs,
+            limit, all_linears, bf16, log_every, save_every,
+        ),
         Cmd::Bench { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
             bench(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
         }

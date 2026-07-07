@@ -87,3 +87,37 @@ pub fn recurrent_gated_delta_rule(
     let out = Tensor::cat(&outs, 2)?; // [B,H,S,Dv]
     Ok((out.transpose(1, 2)?.contiguous()?, state)) // ([B,S,H,Dv], [B,H,Dk,Dv])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{Device, Var};
+
+    /// The load-bearing question for training: does candle's autograd actually
+    /// backprop through the full recurrence — the l2norm, the per-timestep loop,
+    /// the `narrow`/`cat` seam — to a trainable parameter the inputs depend on?
+    /// If a `Var` folded into `q` gets a non-zero grad from an output-derived
+    /// loss, LoRA training through this op is sound.
+    #[test]
+    fn grads_flow_through_recurrence() -> Result<()> {
+        let dev = Device::Cpu;
+        let (b, s, h, dk, dv) = (1usize, 4usize, 2usize, 3usize, 3usize);
+        // A trainable per-(head,key) scale that q depends on — grad must reach it.
+        let w = Var::from_tensor(&Tensor::rand(0.5f32, 1.5f32, (h, dk), &dev)?)?;
+        let base = Tensor::rand(0f32, 1f32, (b, s, h, dk), &dev)?;
+        let q = base.broadcast_mul(&w.as_tensor().reshape((1, 1, h, dk))?)?;
+        let k = Tensor::rand(0f32, 1f32, (b, s, h, dk), &dev)?;
+        let v = Tensor::rand(0f32, 1f32, (b, s, h, dv), &dev)?;
+        let g = Tensor::rand(-1f32, 0f32, (b, s, h), &dev)?; // decay in (0,1)
+        let beta = Tensor::rand(0f32, 1f32, (b, s, h), &dev)?;
+
+        let (out, _) = recurrent_gated_delta_rule(&q, &k, &v, &g, &beta, true, None)?;
+        let loss = out.sqr()?.sum_all()?;
+        let grads = loss.backward()?;
+
+        let gw = grads.get(w.as_tensor()).expect("no gradient reached the Var");
+        let gnorm = gw.sqr()?.sum_all()?.to_scalar::<f32>()?;
+        assert!(gnorm > 0.0, "gradient through the recurrence was zero");
+        Ok(())
+    }
+}
