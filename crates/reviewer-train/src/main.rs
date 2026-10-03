@@ -13,6 +13,8 @@ mod batch;
 mod cache;
 mod chat;
 mod config;
+#[cfg(feature = "cutile")]
+mod cutile_delta;
 mod delta;
 mod generate;
 mod mixer;
@@ -43,6 +45,13 @@ enum Cmd {
     },
     /// Verify the candle Gated DeltaNet recurrence against the synthetic oracle.
     VerifyDelta {
+        #[arg(long)]
+        oracle: PathBuf,
+    },
+    /// Verify the cuTile Gated DeltaNet kernel (through the candle bridge) against the
+    /// oracle and against the candle loop, incl. initial state, bf16, and a decode step.
+    #[cfg(feature = "cutile")]
+    VerifyDeltaCutile {
         #[arg(long)]
         oracle: PathBuf,
     },
@@ -237,6 +246,10 @@ enum Cmd {
         lora_scale: f64,
         #[arg(long, default_value_t = 128)]
         max_new_tokens: usize,
+        /// Skip the batched phase: run and report only the sequential (batch=1) loop.
+        /// Batching long prompts is memory-heavy; this is the inference-latency view.
+        #[arg(long)]
+        sequential_only: bool,
     },
     /// Serve an OpenAI-compatible endpoint (POST /v1/chat/completions) so
     /// `reviewer-run --endpoint` drives the Rust reviewer over the network —
@@ -313,6 +326,8 @@ fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Inspect { oracle } => inspect(&oracle),
         Cmd::VerifyDelta { oracle } => verify_delta(&oracle),
+        #[cfg(feature = "cutile")]
+        Cmd::VerifyDeltaCutile { oracle } => verify_delta_cutile(&oracle),
         Cmd::VerifyMixer { oracle } => verify_mixer(&oracle),
         Cmd::VerifyLayer { oracle } => verify_layer(&oracle),
         Cmd::VerifyAttn { oracle } => verify_attn(&oracle),
@@ -346,8 +361,8 @@ fn main() -> Result<()> {
             &weights, &tokenizer, &data, &out, config.as_deref(), rank, alpha, lr, max_seq, epochs,
             limit, all_linears, bf16, log_every, save_every,
         ),
-        Cmd::Bench { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens } => {
-            bench(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens)
+        Cmd::Bench { jsonl, n, tokenizer, weights, config, bf16, adapter, lora_scale, max_new_tokens, sequential_only } => {
+            bench(&jsonl, n, &tokenizer, &weights, config.as_deref(), bf16, adapter.as_deref(), lora_scale, max_new_tokens, sequential_only)
         }
     }
 }
@@ -426,6 +441,7 @@ fn bench(
     adapter: Option<&std::path::Path>,
     lora_scale: f64,
     max_new_tokens: usize,
+    sequential_only: bool,
 ) -> Result<()> {
     let fixtures = load_fixtures(jsonl, n)?;
     let tok = chat::load_tokenizer(tokenizer)?;
@@ -446,6 +462,18 @@ fn bench(
     }
     let seq_elapsed = t0.elapsed();
     let seq_tokens: usize = seq_outputs.iter().map(|o| o.len()).sum();
+
+    if sequential_only {
+        println!(
+            "sequential: {:.1}s, {seq_tokens} tokens, {:.2} tok/s",
+            seq_elapsed.as_secs_f64(),
+            seq_tokens as f64 / seq_elapsed.as_secs_f64()
+        );
+        for (i, s) in seq_outputs.iter().enumerate() {
+            println!("row {i} sequential: {}", chat::decode(&tok, s)?);
+        }
+        return Ok(());
+    }
 
     println!("--- parallel (batch = {}) ---", prompts.len());
     let t1 = std::time::Instant::now();
@@ -770,6 +798,59 @@ fn verify_mixer(path: &PathBuf) -> Result<()> {
         .with_context(|| format!("loading {}", path.display()))?;
     let got = mixer::mixer_forward(&w, &w["input"], "", &Config::qwen9b())?;
     compare(&got, &w["output"], "full DeltaNet mixer", 1e-3)
+}
+
+#[cfg(feature = "cutile")]
+fn verify_delta_cutile(path: &PathBuf) -> Result<()> {
+    use candle_core::{DType, Tensor};
+    let dev = Device::cuda_if_available(0)?;
+    anyhow::ensure!(dev.is_cuda(), "needs a CUDA device");
+    let maxdiff = |a: &Tensor, b: &Tensor| -> Result<f32> {
+        Ok(a.to_dtype(DType::F32)?.sub(&b.to_dtype(DType::F32)?)?.abs()?.max_all()?.to_scalar::<f32>()?)
+    };
+    let mut ok = true;
+    let mut report = |name: &str, d: f32, tol: f32| {
+        let pass = d < tol;
+        ok &= pass;
+        println!("  {name:<48} max_abs_diff = {d:.3e}  {}", if pass { "MATCH ✓" } else { "MISMATCH ✗" });
+    };
+
+    println!("cuTile gated delta recurrence (through the candle bridge):");
+    // 1. the transformers oracle (tiny: 1x5x2x4x4)
+    let t = safetensors::load(path, &dev).with_context(|| format!("loading {}", path.display()))?;
+    let (got, _) = cutile_delta::recurrent_gated_delta_rule(&t["q"], &t["k"], &t["v"], &t["g"], &t["beta"], None)?;
+    report("vs transformers oracle (delta_synth)", maxdiff(&got, &t["out"])?, 1e-4);
+
+    // 2. real dims vs the candle loop, with a non-zero initial state, an awkward S
+    //    (so the padding path runs), then a decode step continuing from that state.
+    for &dtype in &[DType::F32, DType::BF16] {
+        let (b, s, h, dk, dv) = (1usize, 77usize, 32usize, 128usize, 128usize);
+        let mk = |shape: (usize, usize, usize, usize)| -> Result<Tensor> {
+            Ok(Tensor::randn(0f32, 1f32, shape, &dev)?.to_dtype(dtype)?)
+        };
+        let (q, k, v) = (mk((b, s, h, dk))?, mk((b, s, h, dk))?, mk((b, s, h, dv))?);
+        let g = Tensor::rand(-1f32, 0f32, (b, s, h), &dev)?.to_dtype(dtype)?;
+        let beta = Tensor::rand(0f32, 1f32, (b, s, h), &dev)?.to_dtype(dtype)?;
+        let h0 = (Tensor::randn(0f32, 0.1f32, (b, h, dk, dv), &dev)?).to_dtype(dtype)?;
+        let tol = if dtype == DType::F32 { 1e-3 } else { 1.5e-1 };
+        let label = format!("{dtype:?}");
+
+        let (o_ref, s_ref) = delta::recurrent_gated_delta_rule_loop(&q, &k, &v, &g, &beta, true, Some(&h0))?;
+        let (o_cu, s_cu) = cutile_delta::recurrent_gated_delta_rule(&q, &k, &v, &g, &beta, Some(&h0))?;
+        report(&format!("{label} prefill S=77 out, init state"), maxdiff(&o_cu, &o_ref)?, tol);
+        report(&format!("{label} prefill S=77 final state"), maxdiff(&s_cu, &s_ref)?, tol);
+
+        // decode step (S=1) continuing from each path's own state
+        let (q1, k1, v1) = (mk((b, 1, h, dk))?, mk((b, 1, h, dk))?, mk((b, 1, h, dv))?);
+        let g1 = Tensor::rand(-1f32, 0f32, (b, 1, h), &dev)?.to_dtype(dtype)?;
+        let b1 = Tensor::rand(0f32, 1f32, (b, 1, h), &dev)?.to_dtype(dtype)?;
+        let (d_ref, ds_ref) = delta::recurrent_gated_delta_rule_loop(&q1, &k1, &v1, &g1, &b1, true, Some(&s_ref))?;
+        let (d_cu, ds_cu) = cutile_delta::recurrent_gated_delta_rule(&q1, &k1, &v1, &g1, &b1, Some(&s_cu))?;
+        report(&format!("{label} decode S=1 out"), maxdiff(&d_cu, &d_ref)?, tol);
+        report(&format!("{label} decode S=1 state"), maxdiff(&ds_cu, &ds_ref)?, tol);
+    }
+    anyhow::ensure!(ok, "cuTile kernel disagrees with the reference");
+    Ok(())
 }
 
 fn verify_delta(path: &PathBuf) -> Result<()> {

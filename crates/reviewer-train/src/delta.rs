@@ -38,6 +38,64 @@ pub fn recurrent_gated_delta_rule(
     qk_l2norm: bool,
     initial_state: Option<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
+    if !timing_enabled() {
+        return recurrent_dispatch(q, k, v, g, beta, qk_l2norm, initial_state);
+    }
+    // Attribution mode (`REVIEWER_DELTA_TIMING=1`): sync around the call so the time
+    // is the recurrence's own. Same overhead in both modes, so the comparison is fair.
+    q.device().synchronize()?;
+    let t = std::time::Instant::now();
+    let r = recurrent_dispatch(q, k, v, g, beta, qk_l2norm, initial_state)?;
+    q.device().synchronize()?;
+    DELTA_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    Ok(r)
+}
+
+static DELTA_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn timing_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("REVIEWER_DELTA_TIMING").is_ok())
+}
+
+/// Milliseconds spent in the recurrence since the last call (0 unless timing is on).
+pub fn take_delta_ms() -> f64 {
+    DELTA_NS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
+}
+
+fn recurrent_dispatch(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    qk_l2norm: bool,
+    initial_state: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
+    // Inference-only fast path: the whole recurrence as one cuTile kernel
+    // (`REVIEWER_DELTA=cutile`). The kernel always L2-normalizes q and k.
+    #[cfg(feature = "cutile")]
+    if qk_l2norm
+        && q.device().is_cuda()
+        && crate::cutile_delta::enabled()
+        && q.dim(1)? >= crate::cutile_delta::min_steps()
+    {
+        return crate::cutile_delta::recurrent_gated_delta_rule(q, k, v, g, beta, initial_state);
+    }
+    recurrent_gated_delta_rule_loop(q, k, v, g, beta, qk_l2norm, initial_state)
+}
+
+/// The candle op-by-op loop, always. `recurrent_gated_delta_rule` dispatches here
+/// unless the cuTile path is enabled; the cuTile verifier calls it as the reference.
+pub fn recurrent_gated_delta_rule_loop(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    qk_l2norm: bool,
+    initial_state: Option<&Tensor>,
+) -> Result<(Tensor, Tensor)> {
     let (q, k) = if qk_l2norm {
         (l2norm(q, 1e-6)?, l2norm(k, 1e-6)?)
     } else {

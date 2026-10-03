@@ -234,6 +234,12 @@ pub fn run(
     log_every: usize,
     save_every: usize,
 ) -> Result<()> {
+    if std::env::var("REVIEWER_DELTA").as_deref() == Ok("cutile") {
+        anyhow::bail!(
+            "REVIEWER_DELTA=cutile is inference-only: the cuTile recurrence has no backward \
+             pass, so training through it would silently drop gradients. Unset it to train."
+        );
+    }
     let dev = Device::cuda_if_available(0)?;
     eprintln!("device: {dev:?}");
     let cfg = match config {

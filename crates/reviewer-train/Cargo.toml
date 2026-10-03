@@ -18,8 +18,14 @@ tokenizers = "0.23.1"
 axum = "0.8"
 tokio = { workspace = true }
 rand = "0.8"
+# Optional: cuTile Rust kernels (inference-only Gated DeltaNet recurrence). Needs the
+# CUDA 13.2+ toolchain; see experiments/cutile-deltanet/README.md and Part 21.
+cutile = { version = "0.4.0", optional = true }
 
 [features]
 # Enable candle's CUDA backend (GPU inference/training). Build with
 # `--features cuda`; requires the CUDA toolkit + a compatible GPU.
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
+# Run the Gated DeltaNet recurrence as a cuTile kernel when `REVIEWER_DELTA=cutile`.
+# Inference only: the kernel has no backward pass.
+cutile = ["cuda", "dep:cutile"]

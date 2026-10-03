@@ -70,15 +70,39 @@ pub fn greedy_generate_cached(
 ) -> Result<Vec<u32>> {
     let mut ids = prompt_ids.to_vec();
     let input = Tensor::from_vec(ids.clone(), (1, ids.len()), device)?;
+    let t0 = std::time::Instant::now();
     let (mut logits, mut cache) = cache::prefill(w, &input, cfg, device)?;
 
+    let mut prefill = None;
+    let mut prefill_delta_ms = 0.0;
     for _ in 0..max_new_tokens {
-        let next = argmax_last(&logits)?;
+        let next = argmax_last(&logits)?; // reads the logits back, so the GPU is done here
+        if prefill.is_none() {
+            prefill = Some(t0.elapsed());
+            prefill_delta_ms = crate::delta::take_delta_ms();
+        }
         ids.push(next);
         if eos_ids.contains(&next) {
             break;
         }
         logits = cache::decode_step(w, next, &mut cache, cfg, device)?;
     }
+    let total = t0.elapsed();
+    let prefill = prefill.unwrap_or(total);
+    let decoded = ids.len() - prompt_ids.len();
+    let decode_s = (total - prefill).as_secs_f64();
+    let decode_delta_ms = crate::delta::take_delta_ms();
+    if decode_delta_ms + prefill_delta_ms > 0.0 {
+        eprintln!("recurrence: prefill {prefill_delta_ms:.0} ms, decode {decode_delta_ms:.0} ms (of the times below)");
+    }
+    eprintln!(
+        "timing: prefill {:.0} ms ({} prompt tokens, {:.0} tok/s) | decode {:.2} s for {} tokens ({:.2} tok/s)",
+        prefill.as_secs_f64() * 1e3,
+        prompt_ids.len(),
+        prompt_ids.len() as f64 / prefill.as_secs_f64(),
+        decode_s,
+        decoded.saturating_sub(1),
+        decoded.saturating_sub(1) as f64 / decode_s.max(1e-9),
+    );
     Ok(ids)
 }

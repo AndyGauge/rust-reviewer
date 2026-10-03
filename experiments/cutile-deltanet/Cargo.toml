@@ -1,0 +1,15 @@
+[package]
+name = "cutile-deltanet"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Deliberately NOT a member of the root workspace: cuTile needs the CUDA 13.2+
+# toolchain and only builds on the GB10 box (see `~/cutile-env.sh` there).
+[workspace]
+
+[dependencies]
+cutile = "0.4.0"
+safetensors = "0.4"
+anyhow = "1"
