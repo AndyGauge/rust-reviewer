@@ -9,15 +9,17 @@ oracle, gets wired into the real model, and generates tokens: prefill gets up to
 the one the kernel benchmark can't see.*
 
 I heard about [cuTile Rust](https://github.com/NVlabs/cutile-rs) the way most
-people did: it came out of RustConf 2026, where Melih Elibol's talk
-"Fearless Concurrency on the GPU" was on the schedule, and NVIDIA published it
-on 8 September as one half of "CUDA Rust" (the other half, `cuda-oxide`, is
+people did: it came out of RustConf 2026, where Melih Elibol (NVIDIA) gave the
+talk [Fearless Concurrency on the GPU](https://www.youtube.com/watch?v=ncyHIrXFFAo),
+and NVIDIA published it on 8 September as one half of "CUDA Rust" (the other half, `cuda-oxide`, is
 the classic one-thread-per-lane SIMT model). cuTile is the tile half. You write
 a kernel as ordinary Rust over *tiles* of a tensor, and a `#[cutile::module]`
 macro captures the AST, lowers it through CUDA Tile IR, and JIT-compiles it to
 a cubin for whatever GPU you're on. Mutable tensors are partitioned into
 disjoint tiles before launch, so a kernel can't race with itself by
-construction. NVIDIA's own numbers are for a B200: about 7 TB/s on
+construction. (The paper behind the talk is [on arXiv](https://arxiv.org/abs/2606.15991),
+by Melih Elibol, Jared Roesch, Isaac Gelado, Eric Buehler and Michael Garland.)
+NVIDIA's own numbers are for a B200: about 7 TB/s on
 element-wise ops, about 2 PFlop/s on f16 GEMM.
 
 This series has a Rust trainer, [Path A](blog-19-the-trainer-that-never-trained.md),
