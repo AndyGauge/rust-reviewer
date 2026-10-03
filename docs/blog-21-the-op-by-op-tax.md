@@ -107,19 +107,19 @@ toolchain while I was in there).
 
 ## The baseline
 
-cutile-rs ships criterion benchmarks. Two of them map straight onto the
+cutile-rs ships [criterion benchmarks](https://github.com/NVlabs/cutile-rs/tree/main/cutile-benchmarks/benches). Two of them map straight onto the
 trainer: RMSNorm and softmax, on a 4096-row f16 tensor with the row width N
 swept from 1024 to 32768. I ran those as they are, with the GPU idle and the
 clocks left unlocked.
 
-For the comparison I wrote `bench_ops`, a small binary in `reviewer-train`
+For the comparison I wrote [`bench_ops`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/bin/bench_ops.rs), a small binary in `reviewer-train`
 that times the same shapes in candle on the CUDA backend and reports
 throughput the same way: one read plus one write of the whole tensor. I
 checked that definition by reproducing cutile-rs's own reported GB/s from its
 reported times before trusting it. Three implementations:
 
 - **cuTile**: the cutile-rs kernels.
-- **candle op-by-op**: `rmsnorm` copied from `model.rs` (square, mean, affine,
+- **candle op-by-op**: [`rmsnorm` copied from `model.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/model.rs#L16) (square, mean, affine,
   sqrt, divide, multiply, each its own kernel, plus a tiny one for the weight), and `candle_nn::ops::softmax`.
   This is what the trainer runs today.
 - **candle fused**: `candle_nn::ops::rms_norm` and `softmax_last_dim`, one
@@ -181,7 +181,7 @@ The shape of the problem is a good fit for a tile language. The recurrence is
 sequential in time but independent across (batch, head) pairs, so one program
 per pair, with the whole `[Dk, Dv]` state held in registers for the entire
 loop. Inputs are read once, the state never touches global memory, and the
-L2-norm of `q` and `k` fuses into the same kernel. The core of it:
+L2-norm of `q` and `k` fuses into the same kernel. The core of it (the whole kernel is in [`experiments/cutile-deltanet/src/main.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/experiments/cutile-deltanet/src/main.rs#L26)):
 
 ```rust
 let mut state: Tile<f32, { [DK, DV] }> = constant(0.0f32, shape![DK, DV]);
@@ -199,7 +199,7 @@ for t in 0i32..S {
 }
 ```
 
-Those five commented steps are line for line the five in `delta.rs`. The
+Those five commented steps are line for line the five in [`delta.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/delta.rs#L90). The
 kernel is the recurrence with the loop moved onto the GPU.
 
 **Four things the compiler told me, in order.** The library is young and its
@@ -218,8 +218,8 @@ errors are literal, which made them quick to fix:
 None of those are the kind of thing that costs a day. They're a half-hour of
 reading error text, which is a reasonable price for a first kernel.
 
-**Checking it.** The oracle that `verify-delta` uses, `delta_synth.safetensors`
-(a transformers `torch_recurrent_gated_delta_rule` call on a 1 × 5 × 2 × 4 × 4
+**Checking it.** The oracle that [`verify-delta`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/main.rs#L856) uses, `delta_synth.safetensors`
+(from [`train/delta_rule_synthetic.py`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/train/delta_rule_synthetic.py): a transformers `torch_recurrent_gated_delta_rule` call on a 1 × 5 × 2 × 4 × 4
 input), loads into the new crate directly:
 
 ```
@@ -241,8 +241,10 @@ toy scale first, then at the shape that matters.
 **The benchmark.** Real Qwen3.6-27B dimensions: 48 value heads, `Dk = Dv =
 128`, batch 1, f32. The cuTile column times the kernel only (inputs uploaded
 once, output left on the device). The candle column is the real
-`recurrent_gated_delta_rule` from `delta.rs`, on the GPU, including the
-transposes it does on the way in and out.
+[`recurrent_gated_delta_rule` from `delta.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/delta.rs#L90), on the GPU, including the
+transposes it does on the way in and out. The harnesses are
+[`experiments/cutile-deltanet`](https://github.com/AndyGauge/rust-reviewer/tree/56e79e2/experiments/cutile-deltanet) for cuTile and
+[`bench_delta.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/bin/bench_delta.rs) for candle.
 
 | Sequence length | cuTile | candle | speedup |
 |---|---|---|---|
@@ -263,15 +265,15 @@ Grace CPU's launch latency, which a faster host would shave.
 ## Generating tokens with it
 
 A fast kernel in its own binary proves nothing about the model. The real test is
-the model doing inference with it, so I wired it into `reviewer-train` behind a
+the model doing inference with it, so I wired it into `reviewer-train` ([`cutile_delta.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/cutile_delta.rs)) behind a
 cargo feature (`--features cutile`) and a run-time switch
 (`REVIEWER_DELTA=cutile`). Everything else in the model is the same code.
 
 **The bridge.** Candle owns all the memory and cuTile borrows it. cutile-rs can
 wrap a foreign device allocation as a tensor without a copy
-(`Tensor::from_foreign`), so a candle CUDA buffer becomes a cuTile tensor by
+([`Tensor::from_foreign`, shown in cutile-rs's own interop example](https://github.com/NVlabs/cutile-rs/blob/main/cutile-examples/examples/cudarc_interop.rs)), so a candle CUDA buffer becomes a cuTile tensor by
 implementing a small trait that returns its device pointer, and by keeping the
-candle tensor alive inside the wrapper so the memory can't be freed mid-kernel.
+candle tensor alive inside [the wrapper](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/cutile_delta.rs#L136) so the memory can't be freed mid-kernel.
 Candle allocates the output buffer, cuTile writes into it, and candle reads it
 afterwards. The pointers work in both libraries because they address the same device
 memory, and the bridge synchronizes the device on either side of the launch so
@@ -293,17 +295,17 @@ the two never touch a buffer at once.
   the step count from the tensor's shape at run time fixed it: every size now
   compiles in 0.6 to 0.8 s, once, and no padding is needed.
 - **A guard against training.** The kernel has no backward pass, so a training
-  run with the switch on would silently get no gradients. `train` now refuses to
-  start if `REVIEWER_DELTA=cutile` is set.
+  run with the switch on would silently get no gradients. [`train` now refuses to
+  start](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/train.rs#L237) if `REVIEWER_DELTA=cutile` is set.
 
 **Is it still right?** Two checks. The bridge has its own verifier,
-`verify-delta-cutile`, that runs the kernel through candle against both the
+[`verify-delta-cutile`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/main.rs#L804), that runs the kernel through candle against both the
 transformers oracle and the candle loop, with a nonzero initial state, an
 awkward sequence length, bf16 and f32, and a decode step continuing from the
 kernel's own state. Nine comparisons, nine matches: 4.5e-8 against the oracle,
 about 1e-7 in f32 against the loop, and under 8e-3 in bf16 (where the loop does
 its arithmetic in bf16 and the kernel keeps the state in f32, so some difference
-is expected). The stronger one is `verify-model`, the whole 9B model's logits
+is expected). The stronger one is [`verify-model`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/main.rs#L730), the whole 9B model's logits
 against the PyTorch dump, with all 24 DeltaNet layers going through the kernel:
 
 | | max logit diff | mean logit diff | argmax agreement |
@@ -362,7 +364,7 @@ At one token there is nothing to fuse: the loop's twenty tiny kernels and the
 bridge's thirty-odd candle ops around one cuTile launch cost about the same,
 and sending decode through cuTile as well is about 6% *slower*. So the shipped
 policy is hybrid: sequences of 2 or more steps go to the kernel, single-token
-decode stays on the loop. `REVIEWER_DELTA_MIN_STEPS=1` forces cuTile everywhere,
+decode stays on the loop. [`REVIEWER_DELTA_MIN_STEPS=1`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/cutile_delta.rs#L111) forces cuTile everywhere,
 which is how I measured the third column.
 
 **Same words out?** Not always. Across both passes, the output is identical to
@@ -429,7 +431,7 @@ which says the same thing from a different angle.
 
 Three separate things came out of this.
 
-The cheap one: swap the hand-rolled `rmsnorm` in `model.rs` for
+The cheap one: swap the hand-rolled [`rmsnorm` in `model.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/model.rs#L16) for
 `candle_nn::ops::rms_norm`, re-run the `verify-*` stages, and bank most of the
 6× on that op. That's an afternoon and it doesn't need cuTile. The caveat is the
 `(1 + weight)` scale Qwen uses: the fused op takes the weight directly, so the
@@ -448,13 +450,14 @@ the recurrence's share, is worth more now than another kernel. After that, in
 order: a decode path that doesn't pay for the bridge, the 27B once the box has the
 memory, and, since training is what Path A is for, the backward kernel.
 
-The benches are `crates/reviewer-train/src/bin/bench_ops.rs` and
-`bench_delta.rs`, the standalone kernel crate is `experiments/cutile-deltanet/`,
-and the bridge is `crates/reviewer-train/src/cutile_delta.rs`. To reproduce the
-inference runs, on the box: build with `--features cutile` (after
-`source ~/cutile-env.sh`), then run `reviewer-train bench --sequential-only
---jsonl <prompts> --weights <9B snapshot> --bf16 --adapter <adapter>` with and
-without `REVIEWER_DELTA=cutile`; add `REVIEWER_DELTA_TIMING=1` for the
-recurrence-only attribution. For the earlier numbers, `bench_ops` and
-`bench_delta` with `--features cuda`, and `cargo bench -p cutile-benchmarks --
-rmsnorm` (and `softmax`) in a cutile-rs checkout.
+The benches are [`bench_ops.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/bin/bench_ops.rs) and
+[`bench_delta.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/bin/bench_delta.rs), the standalone kernel crate is
+[`experiments/cutile-deltanet/`](https://github.com/AndyGauge/rust-reviewer/tree/56e79e2/experiments/cutile-deltanet), and the bridge
+is [`cutile_delta.rs`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/cutile_delta.rs). To reproduce the inference runs, on
+the box: build with `--features cutile` (after `source ~/cutile-env.sh`), then
+run [`reviewer-train bench`](https://github.com/AndyGauge/rust-reviewer/blob/56e79e2/crates/reviewer-train/src/main.rs#L434) with `--sequential-only --jsonl
+<prompts> --weights <9B snapshot> --bf16 --adapter <adapter>`, with and without
+`REVIEWER_DELTA=cutile`; add `REVIEWER_DELTA_TIMING=1` for the recurrence-only
+attribution. For the earlier numbers, `bench_ops` and `bench_delta` with
+`--features cuda`, and `cargo bench -p cutile-benchmarks -- rmsnorm` (and
+`softmax`) in a [cutile-rs checkout](https://github.com/NVlabs/cutile-rs/).
