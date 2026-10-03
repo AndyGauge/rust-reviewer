@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill on the GB10</title>
+<style>
+/* Layout: horizontal stacked bars, one pair per prompt (loop above cuTile), so the recurrence share reads at a glance. */
+:root{
+  --bg:#f7f7f5; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#85847f; --grid:#e6e5e0; --axis:#c9c8c2;
+  --rec:#2a78d6; --rest:#c9c8c2;
+  --display:'Fraunces',Georgia,serif; --body:'IBM Plex Sans',system-ui,sans-serif; --mono:'IBM Plex Mono',ui-monospace,monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#121211; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#8d8c84; --grid:#2b2b29; --axis:#444441;
+  --rec:#3987e5; --rest:#4a4a46; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#121211; --surface:#1a1a19; --ink:#ffffff; --ink2:#c3c2b7; --muted:#8d8c84; --grid:#2b2b29; --axis:#444441;
+  --rec:#3987e5; --rest:#4a4a46; color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--body);font-size:15px;line-height:1.5;padding-inline:max(16px,4vw);padding-block:32px}
+main{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+h1{font-family:var(--display);font-weight:600;font-size:clamp(26px,5vw,38px);line-height:1.1;margin:0;text-wrap:balance}
+.sub{color:var(--ink2);max-width:64ch;margin:8px 0 0}
+.kicker{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--grid);border-radius:6px;padding:16px 16px 10px;min-width:0;position:relative}
+.legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--ink2);margin-bottom:8px}
+.legend i{display:inline-block;width:12px;height:12px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+svg{width:100%;height:auto;display:block;overflow:visible}
+svg text{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+svg text.n{fill:var(--ink2)}
+svg text.t{fill:var(--ink);font-weight:500}
+.tip{position:absolute;pointer-events:none;background:var(--surface);border:1px solid var(--axis);border-radius:4px;padding:8px 10px;font-size:12px;line-height:1.5;box-shadow:0 2px 8px rgba(0,0,0,.12);opacity:0;transition:opacity .08s;white-space:nowrap;z-index:2}
+.tip b{font-family:var(--mono);font-weight:500}
+.foot{color:var(--muted);font-size:12px;max-width:72ch}
+.embed header,.embed .foot{display:none}.embed body{padding-block:8px;padding-inline:0}
+</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;600&display=swap">
+
+<main>
+  <header>
+    <div class="kicker">Qwen3.5-9B · bf16 + reviewer adapter · NVIDIA GB10 · warm runs</div>
+    <h1>The recurrence was the slow part of prefill. It isn't any more.</h1>
+    <p class="sub">Time to first token for six real review prompts, split into the DeltaNet recurrence and everything else. Replacing the loop with the cuTile kernel removes nearly all of the recurrence, and the rest of the model is unchanged.</p>
+  </header>
+  <section class="card" id="card">
+    <div class="legend"><span><i style="background:var(--rec)"></i>DeltaNet recurrence</span><span><i style="background:var(--rest)"></i>Rest of the model</span></div>
+    <svg id="svg" role="img" aria-label="Prefill time in seconds for six prompt lengths, comparing the candle loop and the cuTile kernel, split into recurrence and the rest of the model"></svg>
+    <div class="tip" id="tip"></div>
+  </section>
+  <p class="foot">Second pass of a 12-prompt run, so every kernel size is already compiled. Recurrence time comes from a separate run that synchronizes the GPU around each recurrence call; the rest of the model is the total from the unsynchronized run minus that. Greedy decoding, batch 1. First use of each cuTile kernel size adds a one-time 0.6 to 0.9 s of compilation (not shown).</p>
+</main>
+
+<script>
+if(location.hash==="#embed")document.documentElement.classList.add("embed");
+// [prompt tokens, loop total ms, loop recurrence ms, cuTile total ms, cuTile recurrence ms]
+const D=[[351,5484,1430,4347,36],[375,5617,1534,4397,37],[511,6312,2082,4380,47],[513,6235,2098,4356,47],[1188,9406,4873,4683,182],[4419,25652,18265,8924,1092]];
+const W=760,rowH=22,gap=5,grpGap=16,m={l:96,r:70,t:8,b:34};
+const groups=D.length, bars=groups*2;
+const H=m.t+m.b+groups*(2*rowH+gap)+(groups-1)*grpGap;
+const iw=W-m.l-m.r, MAX=27000, x=v=>m.l+iw*v/MAX;
+const svg=document.getElementById('svg'); svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
+let s='';
+for(const v of [0,5,10,15,20,25]){s+=`<line x1="${x(v*1000)}" x2="${x(v*1000)}" y1="${m.t}" y2="${H-m.b}" stroke="${v?'var(--grid)':'var(--axis)'}"/><text x="${x(v*1000)}" y="${H-m.b+16}" text-anchor="middle">${v} s</text>`}
+const bar=(k,y,label,tot,rec,name)=>{
+  const rest=tot-rec;
+  return `<g class="bar" data-k="${k}" data-name="${name}" data-tot="${tot}" data-rec="${rec}">
+    <text x="${m.l-8}" y="${y+rowH/2+4}" text-anchor="end" class="n">${label}</text>
+    <rect x="${x(0)}" y="${y}" width="${x(rest)-x(0)}" height="${rowH}" fill="var(--rest)"/>
+    <rect x="${x(rest)}" y="${y}" width="${Math.max(x(tot)-x(rest),0)}" height="${rowH}" fill="var(--rec)" stroke="var(--surface)" stroke-width="2"/>
+    <text x="${x(tot)+8}" y="${y+rowH/2+4}" class="t">${(tot/1000).toFixed(1)} s</text>
+    <rect x="0" y="${y-2}" width="${W}" height="${rowH+4}" fill="transparent" class="hit"/></g>`};
+D.forEach((r,i)=>{
+  const y0=m.t+i*(2*rowH+gap+grpGap);
+  s+=`<text x="${m.l-8}" y="${y0-3}" text-anchor="end" style="font-size:10px">${r[0]} tokens</text>`;
+  s+=bar(i,y0,'candle loop',r[1],r[2],'candle loop');
+  s+=bar(i,y0+rowH+gap,'cuTile',r[3],r[4],'cuTile');
+});
+svg.innerHTML=s;
+const tip=document.getElementById('tip'),card=document.getElementById('card');
+svg.querySelectorAll('.bar').forEach(g=>{
+  const show=e=>{
+    const tot=+g.dataset.tot,rec=+g.dataset.rec,f=v=>v>=1000?(v/1000).toFixed(2)+' s':v+' ms';
+    tip.innerHTML=`<div style="color:var(--muted)">${D[g.dataset.k][0]} tokens · ${g.dataset.name}</div><div>Total <b>${f(tot)}</b></div><div>Recurrence <b>${f(rec)}</b> (${Math.round(100*rec/tot)}%)</div><div>Rest <b>${f(tot-rec)}</b></div>`;
+    const cr=card.getBoundingClientRect();let l=e.clientX-cr.left+14;if(l+200>cr.width)l=e.clientX-cr.left-210;
+    tip.style.left=Math.max(l,4)+'px';tip.style.top=(e.clientY-cr.top+14)+'px';tip.style.opacity=1};
+  g.addEventListener('pointermove',show);g.addEventListener('pointerdown',show);
+  g.addEventListener('pointerleave',()=>{tip.style.opacity=0});
+});
+</script>
